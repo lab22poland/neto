@@ -3,6 +3,7 @@
 //  neto
 //
 //  Created by Sergii Solianyk on 21/06/2025.
+//  © 2025 Lab22 Poland Sp. z o.o.
 //
 
 import SwiftUI
@@ -114,7 +115,7 @@ struct AboutView: View {
                 Spacer(minLength: 40)
                 
                 VStack(spacing: 8) {
-                    Text("© 2025 Sergii Solianyk")
+                    Text("© 2025 Lab22 Poland Sp. z o.o.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                     
