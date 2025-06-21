@@ -2,6 +2,7 @@
 //  PingView.swift
 //  neto
 //
+//  © 2024 Sergii Solianyk
 //  Created by Sergii Solianyk on 21/06/2025.
 //
 
@@ -259,52 +260,60 @@ struct PingView: View {
             return try await withCheckedThrowingContinuation { continuation in
                 let queue = DispatchQueue(label: "ping.monitor")
                 
-                // Simple reachability check using NWConnection
+                // Create endpoint based on host type
                 let endpoint: NWEndpoint
                 
-                if let _ = IPv4Address(host) {
-                    endpoint = .hostPort(host: .ipv4(IPv4Address(host)!), port: .any)
-                } else if let _ = IPv6Address(host) {
-                    endpoint = .hostPort(host: .ipv6(IPv6Address(host)!), port: .any)
+                if let ipv4 = IPv4Address(host) {
+                    endpoint = .hostPort(host: .ipv4(ipv4), port: 80)
+                } else if let ipv6 = IPv6Address(host) {
+                    endpoint = .hostPort(host: .ipv6(ipv6), port: 80)
                 } else {
-                    endpoint = .hostPort(host: .name(host, nil), port: .any)
+                    endpoint = .hostPort(host: .name(host, nil), port: 80)
                 }
                 
-                let connection = NWConnection(to: endpoint, using: .tcp)
-                var hasResumed = false
+                // Use UDP for a more ping-like experience (lighter weight than TCP)
+                let parameters = NWParameters.udp
+                parameters.prohibitExpensivePaths = false
+                parameters.prohibitConstrainedPaths = false
+                
+                let connection = NWConnection(to: endpoint, using: parameters)
+                var hasCompleted = false
                 let lock = NSLock()
                 
                 connection.stateUpdateHandler = { state in
+                    lock.lock()
+                    defer { lock.unlock() }
+                    
+                    guard !hasCompleted else { return }
+                    
                     switch state {
                     case .ready:
+                        hasCompleted = true
                         connection.cancel()
-                        lock.lock()
-                        if !hasResumed {
-                            hasResumed = true
-                            lock.unlock()
-                            continuation.resume(returning: true)
-                        } else {
-                            lock.unlock()
-                        }
+                        continuation.resume(returning: true)
                     case .failed(let error):
+                        hasCompleted = true
                         connection.cancel()
-                        lock.lock()
-                        if !hasResumed {
-                            hasResumed = true
-                            lock.unlock()
-                            continuation.resume(throwing: error)
+                        // For network unreachable errors, treat as timeout rather than error
+                        if let nwError = error as? NWError {
+                            switch nwError {
+                            case .dns(DNSServiceErrorType(kDNSServiceErr_NoSuchRecord)):
+                                continuation.resume(returning: false)
+                            case .posix(let posixError) where posixError == .ENETUNREACH:
+                                continuation.resume(returning: false)
+                            case .posix(let posixError) where posixError == .EHOSTUNREACH:
+                                continuation.resume(returning: false)
+                            case .posix(let posixError) where posixError == .ETIMEDOUT:
+                                continuation.resume(returning: false)
+                            default:
+                                continuation.resume(throwing: error)
+                            }
                         } else {
-                            lock.unlock()
+                            continuation.resume(throwing: error)
                         }
                     case .cancelled:
-                        lock.lock()
-                        if !hasResumed {
-                            hasResumed = true
-                            lock.unlock()
-                            continuation.resume(returning: false)
-                        } else {
-                            lock.unlock()
-                        }
+                        hasCompleted = true
+                        continuation.resume(returning: false)
                     default:
                         break
                     }
@@ -312,17 +321,15 @@ struct PingView: View {
                 
                 connection.start(queue: queue)
                 
-                // Timeout after 3 seconds (shorter timeout for better responsiveness)
-                DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-                    connection.cancel()
+                // Timeout after 5 seconds
+                DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {
                     lock.lock()
-                    if !hasResumed {
-                        hasResumed = true
-                        lock.unlock()
-                        continuation.resume(returning: false)
-                    } else {
-                        lock.unlock()
-                    }
+                    defer { lock.unlock() }
+                    
+                    guard !hasCompleted else { return }
+                    hasCompleted = true
+                    connection.cancel()
+                    continuation.resume(returning: false)
                 }
             }
         } onCancel: {
