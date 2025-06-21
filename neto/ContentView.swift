@@ -6,61 +6,94 @@
 //
 
 import SwiftUI
-import SwiftData
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
-
+    @State private var selectedTool: NetworkTool? = nil
+    
     var body: some View {
-        NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
-            }
 #if os(macOS)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-#endif
-            .toolbar {
-#if os(iOS)
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
+        NavigationSplitView {
+            ToolsList(selectedTool: $selectedTool)
         } detail: {
-            Text("Select an item")
-        }
-    }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+            if let tool = selectedTool {
+                switch tool {
+                case .ping:
+                    PingView()
+                case .about:
+                    AboutView()
+                }
+            } else {
+                Text("Select a tool from the sidebar")
+                    .foregroundColor(.secondary)
             }
+        }
+        .navigationSplitViewColumnWidth(min: 200, ideal: 250)
+#else
+        NavigationStack {
+            ToolsList(selectedTool: $selectedTool)
+        }
+#endif
+    }
+}
+
+struct ToolsList: View {
+    @Binding var selectedTool: NetworkTool?
+    
+    var body: some View {
+        List(NetworkTool.allCases, selection: $selectedTool) { tool in
+#if os(macOS)
+            Label(tool.title, systemImage: tool.icon)
+                .tag(tool)
+#else
+            NavigationLink(destination: destinationView(for: tool)) {
+                Label(tool.title, systemImage: tool.icon)
+            }
+#endif
+        }
+        .navigationTitle("NETo")
+#if os(macOS)
+        .listStyle(SidebarListStyle())
+#endif
+    }
+    
+#if os(iOS)
+    @ViewBuilder
+    private func destinationView(for tool: NetworkTool) -> some View {
+        switch tool {
+        case .ping:
+            PingView()
+        case .about:
+            AboutView()
+        }
+    }
+#endif
+}
+
+enum NetworkTool: String, CaseIterable, Identifiable {
+    case ping = "ping"
+    case about = "about"
+    
+    var id: String { rawValue }
+    
+    var title: String {
+        switch self {
+        case .ping:
+            return "Ping"
+        case .about:
+            return "About"
+        }
+    }
+    
+    var icon: String {
+        switch self {
+        case .ping:
+            return "network"
+        case .about:
+            return "info.circle"
         }
     }
 }
 
 #Preview {
     ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
 }
