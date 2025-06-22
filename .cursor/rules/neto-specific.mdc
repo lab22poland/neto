@@ -1,0 +1,30 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# NETo Application Context
+
+⚠️ **CONTEXT**: You are now working in the `neto/` submodule - the SwiftUI application.
+
+## Repository Context
+- **Independent Repository**: This is a separate git repository from the main project
+- **Remote**: https://github.com/lab22poland/neto.git
+- **Purpose**: Multiplatform SwiftUI application for network engineers
+
+## Development Focus
+- **Primary Platforms**: iOS, iPadOS, macOS
+- **Core Technology**: SwiftUI with SwiftData persistence
+- **Network Tools**: Focus on network engineering utilities
+
+## File Structure Awareness
+When working in this directory:
+- `neto/` contains the main SwiftUI app source code
+- `netoTests/` contains unit tests
+- `netoUITests/` contains UI tests
+- `neto.xcodeproj/` is the Xcode project file
+
+## Git Operations
+- Git commands in this directory operate on the neto submodule repository
+- This repository uses `main` branch (never `master`)
+- Independent development and versioning from parent project
