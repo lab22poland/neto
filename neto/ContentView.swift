@@ -20,6 +20,8 @@ struct ContentView: View {
                 switch tool {
                 case .ping:
                     PingView()
+                case .traceroute:
+                    TracerouteView()
                 case .about:
                     AboutView()
                 }
@@ -63,6 +65,8 @@ struct ToolsList: View {
         switch tool {
         case .ping:
             PingView()
+        case .traceroute:
+            TracerouteView()
         case .about:
             AboutView()
         }
@@ -72,6 +76,7 @@ struct ToolsList: View {
 
 enum NetworkTool: String, CaseIterable, Identifiable {
     case ping = "ping"
+    case traceroute = "traceroute"
     case about = "about"
     
     var id: String { rawValue }
@@ -80,6 +85,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
         switch self {
         case .ping:
             return "Ping"
+        case .traceroute:
+            return "Traceroute"
         case .about:
             return "About"
         }
@@ -89,6 +96,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
         switch self {
         case .ping:
             return "network"
+        case .traceroute:
+            return "point.topleft.down.curvedto.point.bottomright.up"
         case .about:
             return "info.circle"
         }

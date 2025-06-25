@@ -63,6 +63,14 @@ struct AboutView: View {
                             Text("Ping Tool - Send ICMP echo packets to test network connectivity")
                         }
                         .font(.body)
+                        
+                        HStack {
+                            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                                .foregroundColor(.accentColor)
+                                .frame(width: 20)
+                            Text("Traceroute Tool - Discover the network path to a destination")
+                        }
+                        .font(.body)
                     }
                 }
                 

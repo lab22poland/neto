@@ -15,36 +15,41 @@ struct netoTests {
     // MARK: - NetworkTool Tests
     @Test func networkToolCaseCount() async throws {
         // Test that we have the expected number of tools
-        #expect(NetworkTool.allCases.count == 2)
+        #expect(NetworkTool.allCases.count == 3)
     }
     
     @Test func networkToolIdentifiers() async throws {
         // Test that tool identifiers are correct
         #expect(NetworkTool.ping.id == "ping")
+        #expect(NetworkTool.traceroute.id == "traceroute")
         #expect(NetworkTool.about.id == "about")
     }
     
     @Test func networkToolTitles() async throws {
         // Test that tool titles are correct
         #expect(NetworkTool.ping.title == "Ping")
+        #expect(NetworkTool.traceroute.title == "Traceroute")
         #expect(NetworkTool.about.title == "About")
     }
     
     @Test func networkToolIcons() async throws {
         // Test that tool icons are correct
         #expect(NetworkTool.ping.icon == "network")
+        #expect(NetworkTool.traceroute.icon == "point.topleft.down.curvedto.point.bottomright.up")
         #expect(NetworkTool.about.icon == "info.circle")
     }
     
     @Test func networkToolRawValues() async throws {
         // Test that raw values are correct
         #expect(NetworkTool.ping.rawValue == "ping")
+        #expect(NetworkTool.traceroute.rawValue == "traceroute")
         #expect(NetworkTool.about.rawValue == "about")
     }
     
     @Test func networkToolFromRawValue() async throws {
         // Test that tools can be created from raw values
         #expect(NetworkTool(rawValue: "ping") == .ping)
+        #expect(NetworkTool(rawValue: "traceroute") == .traceroute)
         #expect(NetworkTool(rawValue: "about") == .about)
         #expect(NetworkTool(rawValue: "invalid") == nil)
     }
@@ -112,6 +117,78 @@ struct netoTests {
         #expect(result.message.contains("Host not found"))
     }
     
+    // MARK: - TracerouteResult Tests
+    @Test func tracerouteResultCreation() async throws {
+        let id = UUID()
+        let result = TracerouteResult(
+            id: id,
+            hopNumber: 3,
+            success: true,
+            ipAddress: "192.168.1.1",
+            hostname: "gateway.local",
+            responseTime: 15.2,
+            message: "Hop 3: gateway.local (192.168.1.1)",
+            isDestination: false
+        )
+        
+        #expect(result.id == id)
+        #expect(result.hopNumber == 3)
+        #expect(result.success == true)
+        #expect(result.ipAddress == "192.168.1.1")
+        #expect(result.hostname == "gateway.local")
+        #expect(result.responseTime == 15.2)
+        #expect(result.message == "Hop 3: gateway.local (192.168.1.1)")
+        #expect(result.isDestination == false)
+    }
+    
+    @Test func tracerouteResultDestination() async throws {
+        let result = TracerouteResult(
+            hopNumber: 10,
+            success: true,
+            ipAddress: "8.8.8.8",
+            hostname: "dns.google",
+            responseTime: 50.1,
+            message: "Hop 10: dns.google (8.8.8.8) [DESTINATION REACHED]",
+            isDestination: true
+        )
+        
+        #expect(result.success == true)
+        #expect(result.isDestination == true)
+        #expect(result.message.contains("DESTINATION REACHED"))
+        #expect(result.responseTime > 0)
+    }
+    
+    @Test func tracerouteResultTimeout() async throws {
+        let result = TracerouteResult(
+            hopNumber: 5,
+            success: false,
+            responseTime: 0,
+            message: "Hop 5: * * * Request timed out",
+            isDestination: false
+        )
+        
+        #expect(result.success == false)
+        #expect(result.isDestination == false)
+        #expect(result.responseTime == 0)
+        #expect(result.message.contains("* * *"))
+        #expect(result.message.contains("timed out"))
+    }
+    
+    @Test func tracerouteResultWithDefaults() async throws {
+        let result = TracerouteResult(
+            hopNumber: 1,
+            success: true,
+            responseTime: 5.0,
+            message: "Test hop"
+        )
+        
+        // Test default values
+        #expect(result.ipAddress == nil)
+        #expect(result.hostname == nil)
+        #expect(result.isDestination == false)
+        #expect(result.id != UUID())  // Should have a valid UUID
+    }
+    
     // MARK: - String Validation Tests
     @Test func hostValidation() async throws {
         // Test valid host formats
@@ -167,11 +244,37 @@ struct netoTests {
         #expect(duration < 1.0, "Creating 1000 PingResult objects should take less than 1 second")
     }
     
+    @Test func tracerouteResultCreationPerformance() async throws {
+        let startTime = Date()
+        
+        // Create many traceroute results to test performance
+        var results: [TracerouteResult] = []
+        for i in 1...1000 {
+            let result = TracerouteResult(
+                hopNumber: i,
+                success: i % 3 != 0,
+                ipAddress: i % 2 == 0 ? "192.168.1.\(i % 255)" : nil,
+                hostname: i % 4 == 0 ? "host\(i).local" : nil,
+                responseTime: Double(i) * 0.3,
+                message: "Test hop \(i)",
+                isDestination: i == 1000
+            )
+            results.append(result)
+        }
+        
+        let endTime = Date()
+        let duration = endTime.timeIntervalSince(startTime)
+        
+        #expect(results.count == 1000)
+        #expect(duration < 1.0, "Creating 1000 TracerouteResult objects should take less than 1 second")
+    }
+    
     // MARK: - Network Tool Sequence Tests  
     @Test func networkToolSequence() async throws {
         // Test that NetworkTool conforms to CaseIterable properly
         let allTools = NetworkTool.allCases
         #expect(allTools.contains(.ping))
+        #expect(allTools.contains(.traceroute))
         #expect(allTools.contains(.about))
         
         // Test that each tool has a unique identifier
@@ -208,6 +311,32 @@ struct netoTests {
         #expect(Set(ids).count == 2, "All PingResult objects should have unique IDs")
     }
     
+    // MARK: - Traceroute Result Identifiable Tests
+    @Test func tracerouteResultIdentifiable() async throws {
+        let result1 = TracerouteResult(
+            hopNumber: 1,
+            success: true,
+            responseTime: 10.0,
+            message: "Test hop 1"
+        )
+        
+        let result2 = TracerouteResult(
+            hopNumber: 2,
+            success: false,
+            responseTime: 0,
+            message: "Test hop 2"
+        )
+        
+        // Test that each result has a unique ID
+        #expect(result1.id != result2.id)
+        
+        // Test that we can use TracerouteResult in collections that require Identifiable
+        let results = [result1, result2]
+        let ids = results.map { $0.id }
+        #expect(ids.count == 2)
+        #expect(Set(ids).count == 2, "All TracerouteResult objects should have unique IDs")
+    }
+    
     // MARK: - Message Format Tests
     @Test func pingMessageFormats() async throws {
         // Test successful ping message format
@@ -225,6 +354,24 @@ struct netoTests {
         // Test error message format
         let errorMessage = String(format: "Error seq=%d: %@", sequenceNumber, "Network unreachable")
         #expect(errorMessage == "Error seq=3: Network unreachable")
+    }
+    
+    @Test func tracerouteMessageFormats() async throws {
+        // Test successful hop message format
+        let hopNumber = 5
+        let ipAddress = "192.168.1.1"
+        let hostname = "gateway.local"
+        
+        let hopMessage = String(format: "Hop %d: %@ (%@)", hopNumber, hostname, ipAddress)
+        #expect(hopMessage == "Hop 5: gateway.local (192.168.1.1)")
+        
+        // Test timeout message format
+        let timeoutMessage = String(format: "Hop %d: * * * Request timed out", hopNumber)
+        #expect(timeoutMessage == "Hop 5: * * * Request timed out")
+        
+        // Test destination reached message format
+        let destinationMessage = String(format: "Hop %d: %@ [DESTINATION REACHED]", hopNumber, ipAddress)
+        #expect(destinationMessage == "Hop 5: 192.168.1.1 [DESTINATION REACHED]")
     }
     
     // MARK: - Edge Cases Tests
@@ -261,5 +408,59 @@ struct netoTests {
         )
         #expect(negativeSeqResult.sequenceNumber == -1)
         #expect(negativeSeqResult.success == false)
+        
+        // Test traceroute result with very high hop number
+        let highHopResult = TracerouteResult(
+            hopNumber: 100,
+            success: false,
+            responseTime: 0,
+            message: "Hop 100: Too many hops"
+        )
+        #expect(highHopResult.hopNumber == 100)
+        #expect(highHopResult.success == false)
+        
+        // Test traceroute result with negative hop number (edge case)
+        let negativeHopResult = TracerouteResult(
+            hopNumber: -1,
+            success: false,
+            responseTime: 0,
+            message: "Invalid hop"
+        )
+        #expect(negativeHopResult.hopNumber == -1)
+        #expect(negativeHopResult.success == false)
+    }
+    
+    // MARK: - Data Consistency Tests
+    @Test func tracerouteResultConsistency() async throws {
+        // Test that failed results have zero response time
+        let failedResult = TracerouteResult(
+            hopNumber: 1,
+            success: false,
+            responseTime: 0,
+            message: "Failed hop"
+        )
+        #expect(failedResult.success == false)
+        #expect(failedResult.responseTime == 0)
+        
+        // Test that successful results have positive response time
+        let successResult = TracerouteResult(
+            hopNumber: 1,
+            success: true,
+            responseTime: 25.5,
+            message: "Successful hop"
+        )
+        #expect(successResult.success == true)
+        #expect(successResult.responseTime > 0)
+        
+        // Test destination flag consistency
+        let destinationResult = TracerouteResult(
+            hopNumber: 1,
+            success: true,
+            responseTime: 30.0,
+            message: "Destination reached",
+            isDestination: true
+        )
+        #expect(destinationResult.isDestination == true)
+        #expect(destinationResult.success == true)  // Destination should typically be successful
     }
 }
