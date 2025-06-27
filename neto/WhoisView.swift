@@ -88,6 +88,12 @@ struct WhoisView: View {
                     .buttonStyle(.bordered)
                     .foregroundColor(.red)
                 }
+                
+                if let result = viewModel.whoisResult {
+                    Text(String(format: "Response Time: %.2f ms", result.responseTime))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }
@@ -104,7 +110,7 @@ struct WhoisView: View {
     @ViewBuilder
     private var resultSection: some View {
         if let result = viewModel.whoisResult {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("WHOIS Result")
                         .font(.headline)
@@ -115,96 +121,18 @@ struct WhoisView: View {
                         .foregroundColor(result.success ? .green : .red)
                 }
                 
-                if result.success {
-                    summarySection(for: result)
-                    rawDataSection(for: result)
-                } else {
-                    Text(result.statusMessage)
-                        .foregroundColor(.red)
-                        .font(.body)
+                ScrollView {
+                    Text(result.success ? result.rawResponse : result.statusMessage)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(result.success ? .primary : .red)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
                 }
+                .frame(maxHeight: 400)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-    
-    private func summarySection(for result: WhoisResult) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Summary")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-            
-            VStack(alignment: .leading, spacing: 8) {
-                if let registrar = result.registrar {
-                    infoRow(label: "Registrar", value: registrar)
-                }
-                
-                if let registrationDate = result.registrationDate {
-                    infoRow(label: "Registration Date", value: registrationDate)
-                }
-                
-                if let expirationDate = result.expirationDate {
-                    infoRow(label: "Expiration Date", value: expirationDate)
-                }
-                
-                if let whoisServer = result.whoisServer {
-                    infoRow(label: "WHOIS Server", value: whoisServer)
-                }
-                
-                if !result.nameServers.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Name Servers:")
-                            .font(.system(.body, design: .default))
-                            .fontWeight(.medium)
-                        
-                        ForEach(result.nameServers, id: \.self) { nameServer in
-                            Text("• \(nameServer)")
-                                .font(.system(.body, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                
-                infoRow(label: "Response Time", value: String(format: "%.2f ms", result.responseTime))
-            }
-            .padding()
-            .background(Color(red: 0.95, green: 0.95, blue: 0.97))
-            .cornerRadius(8)
-        }
-    }
-    
-    private func infoRow(label: String, value: String) -> some View {
-        HStack(alignment: .top) {
-            Text("\(label):")
-                .font(.system(.body, design: .default))
-                .fontWeight(.medium)
-                .frame(width: 120, alignment: .leading)
-            
-            Text(value)
-                .font(.system(.body, design: .monospaced))
-                .foregroundColor(.secondary)
-                .textSelection(.enabled)
-            
-            Spacer()
-        }
-    }
-    
-    private func rawDataSection(for result: WhoisResult) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Raw WHOIS Data")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-            
-            ScrollView {
-                Text(result.rawResponse.isEmpty ? "No raw data available" : result.rawResponse)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
-            }
-            .frame(maxHeight: 300)
-            .background(Color(red: 0.95, green: 0.95, blue: 0.97))
-            .cornerRadius(8)
         }
     }
 }

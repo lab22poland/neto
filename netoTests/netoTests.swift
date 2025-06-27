@@ -317,12 +317,12 @@ struct netoTests {
     @Test func whoisManagerTLDMapping() async throws {
         let manager = WhoisManager()
         
-        // Test that the manager exists and can be instantiated
-        #expect(manager != nil)
-        
         // We can't easily test the private TLD mapping method directly,
         // but we can test that the manager doesn't crash during initialization
-        #expect(true, "WhoisManager should initialize successfully")
+        #expect(Bool(true), "WhoisManager should initialize successfully")
+        
+        // Test that we can call the manager - basic smoke test
+        _ = manager
     }
     
     // MARK: - WhoisViewModel Tests
@@ -613,7 +613,6 @@ struct netoTests {
         #expect(successMessage == "WHOIS lookup successful")
         
         // Test failure status message format
-        let domain = "nonexistent.invalid"
         let errorMsg = "Domain not found"
         let failureMessage = String(format: "WHOIS lookup failed: %@", errorMsg)
         #expect(failureMessage == "WHOIS lookup failed: Domain not found")
@@ -861,5 +860,389 @@ struct netoTests {
 extension WhoisViewModel {
     func setTargetDomain(_ domain: String) {
         targetDomain = domain
+    }
+}
+
+// MARK: - WhoisManager Integration Tests
+// These tests make real network calls to WHOIS servers
+struct WhoisManagerIntegrationTests {
+    
+    @Test(.timeLimit(.minutes(10)))
+    func whoisManagerRealDomainLookups() async throws {
+        let manager = WhoisManager()
+        
+        // Test popular .com domains
+        let comDomains = ["google.com", "apple.com", "microsoft.com"]
+        
+        for domain in comDomains {
+            print("Testing WHOIS lookup for: \(domain)")
+            
+            // Use async/await pattern to get result
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            // Basic validation - must always pass
+            #expect(result.domain == domain.lowercased())
+            #expect(result.responseTime > 0, "Response time should be positive for \(domain)")
+            
+            // Network-dependent validation - more lenient for real-world conditions
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "WHOIS response should not be empty for successful \(domain)")
+                #expect(result.statusMessage.contains("successful"), "Status should indicate success for \(domain)")
+                
+                // .com domains should use Verisign server (when successful)
+                #expect(result.whoisServer?.contains("verisign") == true, "COM domains should use Verisign WHOIS server")
+                
+                print("✓ \(domain): Success (Response time: \(String(format: "%.2f", result.responseTime))ms)")
+            } else {
+                print("⚠ \(domain): Failed (\(result.statusMessage))")
+                // Failure is acceptable for integration tests - network issues happen
+            }
+            
+            // No longer checking response keywords here - moved above
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(3)))
+    func whoisManagerDifferentTLDs() async throws {
+        let manager = WhoisManager()
+        
+        // Test different TLD patterns
+        let domains = [
+            "example.org",      // .org
+            "iana.org",         // Another .org
+            "kernel.org"        // Popular .org domain
+        ]
+        
+        for domain in domains {
+            print("Testing TLD for: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.responseTime > 0, "Response time should be positive for \(domain)")
+            
+            // Network-dependent validation - more lenient
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "WHOIS response should not be empty for \(domain)")
+                
+                // .org domains should use PIR server (when successful)
+                if domain.hasSuffix(".org") {
+                    #expect(result.whoisServer?.contains("pir.org") == true, "ORG domains should use PIR WHOIS server")
+                }
+                
+                print("✓ \(domain): Success (Server: \(result.whoisServer ?? "unknown"))")
+            } else {
+                print("⚠ \(domain): Failed (\(result.statusMessage))")
+            }
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(2)))
+    func whoisManagerIPAddressLookups() async throws {
+        let manager = WhoisManager()
+        
+        // Test well-known IP addresses
+        let ipAddresses = [
+            "8.8.8.8",          // Google DNS
+            "1.1.1.1",          // Cloudflare DNS
+            "208.67.222.222"    // OpenDNS
+        ]
+        
+        for ip in ipAddresses {
+            print("Testing WHOIS lookup for IP: \(ip)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: ip) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == ip, "IP address should be preserved as domain field")
+            #expect(result.responseTime > 0, "Response time should be positive for \(ip)")
+            
+            // Network-dependent validation
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "IP WHOIS response should not be empty for \(ip)")
+                
+                // IP lookups should contain network information
+                let response = result.rawResponse.lowercased()
+                let hasNetworkInfo = response.contains("netrange") || 
+                                   response.contains("inetnum") || 
+                                   response.contains("cidr") ||
+                                   response.contains("network")
+                #expect(hasNetworkInfo, "IP WHOIS should contain network range information for \(ip)")
+                
+                print("✓ \(ip): Success (Response time: \(String(format: "%.2f", result.responseTime))ms)")
+            } else {
+                print("⚠ \(ip): Failed (\(result.statusMessage))")
+            }
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(2)))
+    func whoisManagerIPv6Lookups() async throws {
+        let manager = WhoisManager()
+        
+        // Test IPv6 addresses
+        let ipv6Addresses = [
+            "2001:4860:4860::8888",  // Google IPv6 DNS
+            "2606:4700:4700::1111"   // Cloudflare IPv6 DNS
+        ]
+        
+        for ipv6 in ipv6Addresses {
+            print("Testing WHOIS lookup for IPv6: \(ipv6)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: ipv6) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == ipv6, "IPv6 address should be preserved as domain field")
+            #expect(result.responseTime > 0, "Response time should be positive for \(ipv6)")
+            
+            // Network-dependent validation
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "IPv6 WHOIS response should not be empty for \(ipv6)")
+                
+                // IPv6 lookups should contain network information
+                let response = result.rawResponse.lowercased()
+                let hasIPv6Info = response.contains("inet6num") || 
+                                response.contains("ipv6") ||
+                                response.contains("2001:") ||
+                                response.contains("2606:")
+                #expect(hasIPv6Info, "IPv6 WHOIS should contain IPv6 network information for \(ipv6)")
+                
+                print("✓ \(ipv6): Success (Response time: \(String(format: "%.2f", result.responseTime))ms)")
+            } else {
+                print("⚠ \(ipv6): Failed (\(result.statusMessage))")
+            }
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(2)))
+    func whoisManagerCountryCodeTLDs() async throws {
+        let manager = WhoisManager()
+        
+        // Test country code TLDs
+        let ccTLDs = [
+            "example.co.uk",    // UK
+            "nic.de",           // Germany
+            "afnic.fr"          // France
+        ]
+        
+        for domain in ccTLDs {
+            print("Testing ccTLD for: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.responseTime > 0, "Response time should be positive for \(domain)")
+            
+            // Network-dependent validation
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "ccTLD WHOIS response should not be empty for \(domain)")
+                
+                // Verify appropriate WHOIS server was used (when successful)
+                if domain.hasSuffix(".uk") {
+                    #expect(result.whoisServer?.contains("nominet") == true, "UK domains should use Nominet server")
+                } else if domain.hasSuffix(".de") {
+                    #expect(result.whoisServer?.contains("denic") == true, "DE domains should use DENIC server")
+                } else if domain.hasSuffix(".fr") {
+                    #expect(result.whoisServer?.contains("afnic") == true, "FR domains should use AFNIC server")
+                }
+                
+                print("✓ \(domain): Success (Server: \(result.whoisServer ?? "unknown"))")
+            } else {
+                print("⚠ \(domain): Failed (\(result.statusMessage))")
+            }
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(1)))
+    func whoisManagerInvalidDomains() async throws {
+        let manager = WhoisManager()
+        
+        // Test invalid/non-existent domains
+        let invalidDomains = [
+            "thisisnotarealdomain12345.com",
+            "nonexistent.invalid",
+            "definitely-does-not-exist.xyz"
+        ]
+        
+        for domain in invalidDomains {
+            print("Testing invalid domain: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == domain.lowercased())
+            #expect(result.responseTime > 0, "Should still measure response time for \(domain)")
+            
+            // Invalid domains might succeed with "No Data Found" response
+            // or fail outright - both are acceptable
+            if result.success {
+                let response = result.rawResponse.lowercased()
+                let isNoDataResponse = response.contains("no data found") ||
+                                     response.contains("no match") ||
+                                     response.contains("not found") ||
+                                     response.contains("no matching record")
+                #expect(isNoDataResponse, "Successful response for invalid domain should indicate no data found")
+            } else {
+                #expect(result.statusMessage.contains("failed"), "Failed response should have appropriate status message")
+            }
+            
+            print("✓ \(domain): Handled appropriately (Success: \(result.success))")
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(1)))
+    func whoisManagerMalformedInputs() async throws {
+        let manager = WhoisManager()
+        
+        // Test malformed inputs that should fail gracefully
+        let malformedInputs = [
+            "",                     // Empty string
+            "not-a-domain",        // No TLD
+            "spaces in domain.com", // Invalid characters
+            "999.999.999.999"      // Invalid IP
+        ]
+        
+        for input in malformedInputs {
+            print("Testing malformed input: '\(input)'")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: input) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == input.lowercased())
+            #expect(result.success == false, "Malformed input should fail: '\(input)'")
+            #expect(result.statusMessage.contains("failed"), "Status should indicate failure for: '\(input)'")
+            #expect(result.rawResponse.isEmpty, "Raw response should be empty for failed lookup: '\(input)'")
+            #expect(result.responseTime >= 0, "Response time should be non-negative for: '\(input)'")
+            
+            print("✓ '\(input)': Failed gracefully")
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(2)))
+    func whoisManagerNewGenericTLDs() async throws {
+        let manager = WhoisManager()
+        
+        // Test some new generic TLDs
+        let newTLDs = [
+            "nic.tech",         // .tech TLD
+            "google.dev",       // .dev TLD  
+            "test.app"          // .app TLD
+        ]
+        
+        for domain in newTLDs {
+            print("Testing new gTLD: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == domain.lowercased())
+            #expect(result.responseTime > 0, "Should measure response time for \(domain)")
+            
+            // New gTLDs should either succeed or fail gracefully
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "Successful lookup should have response data for \(domain)")
+                #expect(result.registrar != nil || !result.nameServers.isEmpty, "Should have some parsed data for \(domain)")
+            } else {
+                #expect(result.statusMessage.contains("failed"), "Failed lookup should have appropriate message for \(domain)")
+            }
+            
+            print("✓ \(domain): \(result.success ? "Success" : "Handled failure") (Response time: \(String(format: "%.2f", result.responseTime))ms)")
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(1)))
+    func whoisManagerEdgeCaseDomains() async throws {
+        let manager = WhoisManager()
+        
+        // Test edge case domains
+        let edgeCases = [
+            "a.com",                    // Single character
+            "very-long-domain-name-that-tests-length-limits.com", // Long domain
+            "sub.domain.example.com"    // Subdomain
+        ]
+        
+        for domain in edgeCases {
+            print("Testing edge case: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            
+            #expect(result.domain == domain.lowercased())
+            #expect(result.responseTime > 0, "Should measure response time for \(domain)")
+            
+            // Edge cases should be handled gracefully
+            if result.success {
+                #expect(!result.rawResponse.isEmpty, "Successful lookup should have response data for \(domain)")
+            }
+            
+            print("✓ \(domain): \(result.success ? "Success" : "Handled") (Response time: \(String(format: "%.2f", result.responseTime))ms)")
+        }
+    }
+    
+    @Test(.timeLimit(.minutes(2)))
+    func whoisManagerPerformanceValidation() async throws {
+        let manager = WhoisManager()
+        
+        // Test performance with rapid successive queries
+        let testDomains = ["google.com", "apple.com", "microsoft.com"]
+        var results: [WhoisResult] = []
+        
+        let startTime = Date()
+        
+        // Perform lookups sequentially to test performance
+        for domain in testDomains {
+            print("Performance test for: \(domain)")
+            
+            let result = await withCheckedContinuation { continuation in
+                let _ = manager.performWhois(for: domain) { result in
+                    continuation.resume(returning: result)
+                }
+            }
+            results.append(result)
+            
+            #expect(result.success == true, "Performance test should succeed for \(domain)")
+            #expect(result.responseTime < 10000, "Response should be under 10 seconds for \(domain)")
+        }
+        
+        let totalTime = Date().timeIntervalSince(startTime)
+        
+        #expect(results.count == testDomains.count)
+        #expect(totalTime < 30, "Three WHOIS lookups should complete within 30 seconds")
+        
+        print("✓ Performance test completed in \(String(format: "%.2f", totalTime)) seconds")
+        
+        // Verify all results have reasonable response times
+        for result in results {
+            #expect(result.responseTime > 0, "All results should have positive response times")
+            #expect(result.responseTime < 10000, "All results should complete within 10 seconds")
+        }
     }
 } 
