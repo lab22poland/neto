@@ -43,25 +43,7 @@ final class WhoisManager {
                 return
             }
             
-            let whoisServer = await determineWhoisServer(for: cleanDomain)
-            let whoisData = try await queryWhoisServer(server: whoisServer, domain: cleanDomain)
-            let endTime = Date()
-            let responseTime = endTime.timeIntervalSince(startTime) * 1000 // Convert to milliseconds
-            
-            let parsedResult = parseWhoisResponse(whoisData, for: cleanDomain)
-            
-            let result = WhoisResult(
-                domain: cleanDomain,
-                success: true,
-                rawResponse: whoisData,
-                registrar: parsedResult.registrar,
-                registrationDate: parsedResult.registrationDate,
-                expirationDate: parsedResult.expirationDate,
-                nameServers: parsedResult.nameServers,
-                whoisServer: whoisServer,
-                statusMessage: "WHOIS lookup successful",
-                responseTime: responseTime
-            )
+            let result = try await performCascadedWhoisLookup(domain: cleanDomain, startTime: startTime)
             
             await MainActor.run {
                 onResult(result)
@@ -89,6 +71,76 @@ final class WhoisManager {
         }
     }
     
+    /// Performs a cascaded WHOIS lookup, following redirects as needed
+    private func performCascadedWhoisLookup(domain: String, startTime: Date) async throws -> WhoisResult {
+        let whoisServer = await determineWhoisServer(for: domain)
+        let whoisData = try await queryWhoisServer(server: whoisServer, domain: domain)
+        
+        // Check if we got a redirect to another WHOIS server
+        let redirectServer = checkForWhoisRedirect(in: whoisData)
+        
+        let finalData: String
+        let finalServer: String
+        
+        if let redirect = redirectServer, redirect != whoisServer {
+            // Follow the redirect for more detailed information
+            finalData = try await queryWhoisServer(server: redirect, domain: domain)
+            finalServer = redirect
+        } else {
+            finalData = whoisData
+            finalServer = whoisServer
+        }
+        
+        let endTime = Date()
+        let responseTime = endTime.timeIntervalSince(startTime) * 1000
+        
+        let parsedResult = parseWhoisResponse(finalData, for: domain)
+        
+        return WhoisResult(
+            domain: domain,
+            success: true,
+            rawResponse: finalData,
+            registrar: parsedResult.registrar,
+            registrationDate: parsedResult.registrationDate,
+            expirationDate: parsedResult.expirationDate,
+            nameServers: parsedResult.nameServers,
+            whoisServer: finalServer,
+            statusMessage: "WHOIS lookup successful",
+            responseTime: responseTime
+        )
+    }
+    
+    /// Checks if the WHOIS response contains a redirect to another WHOIS server
+    private func checkForWhoisRedirect(in response: String) -> String? {
+        let lines = response.components(separatedBy: .newlines)
+        
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowercaseLine = trimmedLine.lowercased()
+            
+            // Look for various redirect patterns
+            if lowercaseLine.hasPrefix("whois server:") ||
+               lowercaseLine.hasPrefix("registrar whois server:") ||
+               lowercaseLine.hasPrefix("whois:") {
+                let parts = trimmedLine.components(separatedBy: .whitespaces)
+                if parts.count >= 2 {
+                    let server = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return server?.isEmpty == false ? server : nil
+                }
+            }
+            
+            // Look for "refer:" pattern used by IANA
+            if lowercaseLine.hasPrefix("refer:") {
+                let parts = trimmedLine.components(separatedBy: .whitespaces)
+                if parts.count >= 2 {
+                    return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        
+        return nil
+    }
+    
     /// Determines the appropriate WHOIS server for a given domain
     private func determineWhoisServer(for domain: String) async -> String {
         // Check if it's an IP address
@@ -99,7 +151,7 @@ final class WhoisManager {
         // Extract TLD from domain
         let components = domain.components(separatedBy: ".")
         guard let tld = components.last else {
-            return "whois.internic.net" // Default fallback
+            return "whois.iana.org" // Default fallback
         }
         
         // Common TLD to WHOIS server mappings
@@ -123,10 +175,159 @@ final class WhoisManager {
             "br": "whois.registro.br",
             "pl": "whois.dns.pl",
             "io": "whois.nic.io",
-            "me": "whois.nic.me"
+            "me": "whois.nic.me",
+            "ua": "whois.ua",
+            "se": "whois.iis.se",
+            "dk": "whois.dk-hostmaster.dk",
+            "fi": "whois.fi",
+            "no": "whois.norid.no",
+            "nl": "whois.domain-registry.nl",
+            "be": "whois.dns.be",
+            "ch": "whois.nic.ch",
+            "at": "whois.nic.at",
+            "it": "whois.nic.it",
+            "es": "whois.nic.es"
         ]
         
-        return whoisServers[tld] ?? "whois.internic.net"
+        // If we have a known server, use it
+        if let knownServer = whoisServers[tld] {
+            return knownServer
+        }
+        
+        // For unknown TLDs, query IANA to discover the correct WHOIS server
+        return await discoverWhoisServer(for: tld)
+    }
+    
+    /// Discovers the WHOIS server for a TLD by querying IANA
+    private func discoverWhoisServer(for tld: String) async -> String {
+        do {
+            let ianaResponse = try await queryWhoisServer(server: "whois.iana.org", domain: tld)
+            
+            // Parse the IANA response to find the WHOIS server
+            let lines = ianaResponse.components(separatedBy: .newlines)
+            for line in lines {
+                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedLine.lowercased().hasPrefix("whois:") {
+                    let parts = trimmedLine.components(separatedBy: .whitespaces)
+                    if parts.count >= 2 {
+                        return parts[1] // Return the server name
+                    }
+                }
+            }
+        } catch {
+            // If IANA query fails, fall back to a reasonable default
+            print("Failed to discover WHOIS server for TLD .\(tld): \(error)")
+        }
+        
+        // Fallback to IANA for unknown TLDs
+        return "whois.iana.org"
+    }
+    
+    /// Queries a WHOIS server for domain information
+    private func queryWhoisServer(server: String, domain: String) async throws -> String {
+        return try await withCheckedThrowingContinuation { continuation in
+            Task {
+                do {
+                    let result = try await performNetworkQuery(server: server, domain: domain)
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    /// Performs the actual network query with proper async/await handling
+    private func performNetworkQuery(server: String, domain: String) async throws -> String {
+        let endpoint = NWEndpoint.hostPort(host: .name(server, nil), port: 43)
+        let parameters = NWParameters.tcp
+        parameters.prohibitExpensivePaths = false
+        parameters.prohibitConstrainedPaths = false
+        
+        let connection = NWConnection(to: endpoint, using: parameters)
+        
+        // Set up connection state monitoring
+        let connectionReady = await withCheckedContinuation { continuation in
+            var hasResumed = false
+            
+            connection.stateUpdateHandler = { state in
+                guard !hasResumed else { return }
+                
+                switch state {
+                case .ready:
+                    hasResumed = true
+                    continuation.resume(returning: true)
+                case .failed(let error):
+                    hasResumed = true
+                    continuation.resume(returning: false)
+                case .cancelled:
+                    if !hasResumed {
+                        hasResumed = true
+                        continuation.resume(returning: false)
+                    }
+                default:
+                    break
+                }
+            }
+            
+            connection.start(queue: DispatchQueue(label: "whois.connection"))
+        }
+        
+        guard connectionReady else {
+            connection.cancel()
+            throw URLError(.cannotConnectToHost)
+        }
+        
+        // Send the query
+        let query = "\(domain)\r\n"
+        guard let queryData = query.data(using: .utf8) else {
+            connection.cancel()
+            throw URLError(.badURL)
+        }
+        
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: queryData, completion: .contentProcessed { error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+        
+        // Receive the response
+        let responseData = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            let receivedData = NSMutableData()
+            
+            func receiveNextChunk() {
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    
+                    if let data = data {
+                        receivedData.append(data)
+                    }
+                    
+                    if isComplete {
+                        continuation.resume(returning: Data(receivedData))
+                    } else {
+                        receiveNextChunk()
+                    }
+                }
+            }
+            
+            receiveNextChunk()
+        }
+        
+        connection.cancel()
+        
+        guard let responseString = String(data: responseData, encoding: .utf8) else {
+            throw URLError(.badServerResponse)
+        }
+        
+        return responseString
     }
     
     /// Safe state management for network operations
@@ -148,117 +349,6 @@ final class WhoisManager {
             }
             _hasCompleted = true
             return true // Successfully marked as completed
-        }
-    }
-    
-    /// Queries a WHOIS server for domain information
-    private func queryWhoisServer(server: String, domain: String) async throws -> String {
-        return try await withTaskCancellationHandler {
-            return try await withCheckedThrowingContinuation { continuation in
-                let queue = DispatchQueue(label: "whois.query")
-                let endpoint = NWEndpoint.hostPort(host: .name(server, nil), port: 43)
-                let parameters = NWParameters.tcp
-                parameters.prohibitExpensivePaths = false
-                parameters.prohibitConstrainedPaths = false
-                
-                let connection = NWConnection(to: endpoint, using: parameters)
-                let state = NetworkState()
-                let receivedData = NSMutableData()
-                
-                connection.stateUpdateHandler = { connectionState in
-                    guard !state.hasCompleted else { return }
-                    
-                    switch connectionState {
-                    case .ready:
-                        // Send the domain query
-                        let query = "\(domain)\r\n"
-                        if let queryData = query.data(using: .utf8) {
-                            connection.send(content: queryData, completion: .contentProcessed { error in
-                                if let error = error, state.markCompleted() {
-                                    connection.cancel()
-                                    continuation.resume(throwing: error)
-                                }
-                            })
-                            
-                            // Start receiving data
-                            self.receiveData(
-                                connection: connection,
-                                continuation: continuation,
-                                state: state,
-                                receivedData: receivedData
-                            )
-                        }
-                        
-                    case .failed(let error):
-                        if state.markCompleted() {
-                            connection.cancel()
-                            continuation.resume(throwing: error)
-                        }
-                        
-                    case .cancelled:
-                        if state.markCompleted() {
-                            continuation.resume(throwing: URLError(.cancelled))
-                        }
-                        
-                    default:
-                        break
-                    }
-                }
-                
-                connection.start(queue: queue)
-                
-                // Timeout after 30 seconds
-                DispatchQueue.global().asyncAfter(deadline: .now() + 30.0) {
-                    if state.markCompleted() {
-                        connection.cancel()
-                        continuation.resume(throwing: URLError(.timedOut))
-                    }
-                }
-            }
-        } onCancel: {
-            // This handler will be called when the task is cancelled
-        }
-    }
-    
-    /// Recursively receives data from the WHOIS server
-    private func receiveData(
-        connection: NWConnection,
-        continuation: CheckedContinuation<String, Error>,
-        state: NetworkState,
-        receivedData: NSMutableData
-    ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
-            guard !state.hasCompleted else { return }
-            
-            if let error = error, state.markCompleted() {
-                connection.cancel()
-                continuation.resume(throwing: error)
-                return
-            }
-            
-            if let data = data {
-                receivedData.append(data)
-            }
-            
-            if isComplete {
-                if state.markCompleted() {
-                    connection.cancel()
-                    
-                    if let responseString = String(data: receivedData as Data, encoding: .utf8) {
-                        continuation.resume(returning: responseString)
-                    } else {
-                        continuation.resume(returning: "Invalid response encoding")
-                    }
-                }
-            } else {
-                // Continue receiving data
-                self.receiveData(
-                    connection: connection,
-                    continuation: continuation,
-                    state: state,
-                    receivedData: receivedData
-                )
-            }
         }
     }
     
