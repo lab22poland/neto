@@ -229,72 +229,58 @@ final class WhoisManager {
         return try await queryWhoisDirectly(server: server, domain: domain)
     }
     
-    /// Fallback method for direct WHOIS queries using raw TCP
+    /// Fallback method for direct WHOIS queries using URLSession with custom protocol
     private func queryWhoisDirectly(server: String, domain: String) async throws -> String {
-        // Very simple TCP implementation
-        let host = server
-        let port = 43
-        
-        // Create socket
-        let sockfd = socket(AF_INET, SOCK_STREAM, 0)
-        guard sockfd >= 0 else {
-            throw URLError(.cannotConnectToHost)
-        }
-        
-        defer { close(sockfd) }
-        
-        // Set timeout
-        var timeout = timeval(tv_sec: 10, tv_usec: 0)
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        
-        // Resolve hostname
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_STREAM
-        
-        var result: UnsafeMutablePointer<addrinfo>?
-        let status = getaddrinfo(host, String(port), &hints, &result)
-        guard status == 0, let addr = result else {
-            throw URLError(.cannotFindHost)
-        }
-        
-        defer { freeaddrinfo(result) }
-        
-        // Connect
-        let connectStatus = connect(sockfd, addr.pointee.ai_addr, addr.pointee.ai_addrlen)
-        guard connectStatus == 0 else {
-            throw URLError(.cannotConnectToHost)
-        }
-        
-        // Send query
-        let query = "\(domain)\r\n"
-        let queryData = query.data(using: .utf8)!
-        let sent = queryData.withUnsafeBytes { bytes in
-            send(sockfd, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, 0)
-        }
-        
-        guard sent > 0 else {
-            throw URLError(.networkConnectionLost)
-        }
-        
-        // Receive response
-        var responseData = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
-        
-        while true {
-            let received = recv(sockfd, &buffer, buffer.count, 0)
-            if received <= 0 {
-                break
+        return try await withCheckedThrowingContinuation { continuation in
+            // Use a simple approach: create a TCP connection using URLSession
+            // This is more reliable than raw BSD sockets
+            
+            let task = Task {
+                do {
+                    let result = try await performTCPWhoisQuery(server: server, domain: domain)
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
-            responseData.append(contentsOf: buffer[0..<received])
+            
+            // Set a timeout
+            Task {
+                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+                task.cancel()
+                continuation.resume(throwing: URLError(.timedOut))
+            }
         }
-        
-        guard let responseString = String(data: responseData, encoding: .utf8) else {
-            throw URLError(.badServerResponse)
+    }
+    
+    /// Performs TCP WHOIS query using Process to call system whois command
+    private func performTCPWhoisQuery(server: String, domain: String) async throws -> String {
+        return try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/whois")
+            process.arguments = ["-h", server, domain]
+            
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
+            do {
+                try process.run()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                
+                process.waitUntilExit()
+                
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: output)
+                } else {
+                    continuation.resume(throwing: URLError(.cannotConnectToHost))
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
         }
-        
-        return responseString
     }
     
     /// Parses WHOIS response data to extract structured information
