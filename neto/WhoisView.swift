@@ -39,7 +39,7 @@ struct WhoisView: View {
                 .font(.largeTitle)
                 .fontWeight(.bold)
             
-            Text("Query domain registration information and IP address details")
+            Text("RFC 3912 compliant WHOIS queries for domains, IP addresses, AS numbers, and person/organization records")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
@@ -47,10 +47,10 @@ struct WhoisView: View {
     
     private var inputSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Domain or IP Address")
+            Text("Query Target")
                 .font(.headline)
             
-            TextField("Enter domain name or IP address", text: $viewModel.targetDomain)
+            TextField("Enter domain, IP address, AS number, or person/organization", text: $viewModel.targetQuery)
                 .textFieldStyle(.roundedBorder)
 #if os(iOS)
                 .autocapitalization(.none)
@@ -60,10 +60,44 @@ struct WhoisView: View {
                 .frame(maxWidth: 400)
 #endif
                 .onSubmit {
-                    if viewModel.isTargetDomainValid && !viewModel.isLoading {
+                    if viewModel.isTargetQueryValid && !viewModel.isLoading {
                         viewModel.startWhoisLookup()
                     }
                 }
+            
+            // Examples section
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Examples:")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Button("google.com") { viewModel.targetQuery = "google.com" }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundColor(.blue)
+                        
+                        Button("8.8.8.8") { viewModel.targetQuery = "8.8.8.8" }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundColor(.blue)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Button("AS15169") { viewModel.targetQuery = "AS15169" }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundColor(.blue)
+                        
+                        Button("2001:4860:4860::8888") { viewModel.targetQuery = "2001:4860:4860::8888" }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundColor(.blue)
+                    }
+                }
+            }
+            .padding(.top, 4)
             
             HStack(spacing: 12) {
                 Button(action: viewModel.startWhoisLookup) {
@@ -77,7 +111,7 @@ struct WhoisView: View {
                     }
                     .frame(minWidth: 160, minHeight: 32)
                 }
-                .disabled(!viewModel.isTargetDomainValid || viewModel.isLoading)
+                .disabled(!viewModel.isTargetQueryValid || viewModel.isLoading)
                 .buttonStyle(.borderedProminent)
                 
                 if viewModel.isLoading {
@@ -117,8 +151,71 @@ struct WhoisView: View {
                     
                     Spacer()
                     
+                    if let server = result.whoisServer {
+                        Text("Server: \(server)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
                     Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
                         .foregroundColor(result.success ? .green : .red)
+                }
+                
+                // Quick info section for successful results
+                if result.success {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let registrar = result.registrar {
+                            HStack {
+                                Text("Registrar/Organization:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(registrar)
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                        }
+                        
+                        if let created = result.registrationDate {
+                            HStack {
+                                Text("Created/Registered:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(created)
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                        }
+                        
+                        if let expires = result.expirationDate {
+                            HStack {
+                                Text("Expires:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(expires)
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                        }
+                        
+                        if !result.nameServers.isEmpty {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Name Servers:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                ForEach(result.nameServers.prefix(3), id: \.self) { server in
+                                    Text("• \(server)")
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                }
+                                if result.nameServers.count > 3 {
+                                    Text("• ... and \(result.nameServers.count - 3) more")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.bottom, 8)
                 }
                 
                 ScrollView {

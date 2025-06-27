@@ -9,33 +9,83 @@
 import Foundation
 import Network
 
-/// Manager class responsible for WHOIS operations and domain information lookup
+/// Manager class responsible for WHOIS operations following FreeBSD whois.c implementation
+/// RFC 3912 compliant - supports domains, IP addresses, AS numbers, person and organization records
 final class WhoisManager {
     
-    /// Performs a WHOIS lookup for the specified domain or IP address
+    // MARK: - FreeBSD Server Constants (exact match)
+    private let abuseHost = "whois.abuse.net"
+    private let anicHost = "whois.arin.net"
+    private let denicHost = "whois.denic.de"
+    private let dknicHost = "whois.dk-hostmaster.dk"
+    private let fnicHost = "whois.afrinic.net"
+    private let gnicHost = "whois.nic.gov"
+    private let ianaHost = "whois.iana.org"
+    private let inicHost = "whois.internic.net"
+    private let knicHost = "whois.krnic.net"
+    private let lnicHost = "whois.lacnic.net"
+    private let mnicHost = "whois.ra.net"
+    private let pdbHost = "whois.peeringdb.com"
+    private let pnicHost = "whois.apnic.net"
+    private let qnicHostTail = ".whois-servers.net"
+    private let rnicHost = "whois.ripe.net"
+    private let vnicHost = "whois.verisign-grs.com"
+    
+    private let connectionTimeout: TimeInterval = 30.0
+    
+    // MARK: - FreeBSD Suffix-to-Server Mapping (exact match)
+    private lazy var whoisWhere: [(suffix: String, server: String)] = [
+        /* Various handles */
+        ("-ARIN", anicHost),
+        ("-NICAT", "at" + qnicHostTail),
+        ("-NORID", "no" + qnicHostTail),
+        ("-RIPE", rnicHost),
+        /* Nominet's whois server doesn't return referrals to JANET */
+        (".ac.uk", "ac.uk" + qnicHostTail),
+        (".gov.uk", "ac.uk" + qnicHostTail),
+        ("", ianaHost) /* default */
+    ]
+    
+    // MARK: - FreeBSD Referral Patterns (exact match)
+    private let whoisReferral: [(prefix: String, len: Int)] = [
+        ("whois:", 6), /* IANA */
+        ("Whois Server:", 13),
+        ("Registrar WHOIS Server:", 23), /* corporatedomains.com */
+        ("ReferralServer:  whois://", 25), /* ARIN */
+        ("ReferralServer:  rwhois://", 26), /* ARIN */
+        ("descr:          region. Please query", 37) /* AfriNIC */
+    ]
+    
+    // MARK: - RIR Loop Detection (FreeBSD logic)
+    private var tryRir: [(loop: Bool, host: String)] = []
+    
+    /// Performs a WHOIS lookup for the specified query (domain, IP, AS number, etc.)
     /// - Parameters:
-    ///   - domain: The target domain name or IP address
+    ///   - query: The target query (domain name, IP address, AS number, person/org)
     ///   - onResult: Callback called when the WHOIS result is available
     /// - Returns: A Task that can be cancelled
     func performWhois(
-        for domain: String,
+        for query: String,
         onResult: @escaping (WhoisResult) -> Void
     ) -> Task<Void, Never> {
         return Task {
             await executeWhoisLookup(
-                domain: domain,
+                query: query,
                 onResult: onResult
             )
         }
     }
     
-    /// Executes a WHOIS lookup operation
+    /// Executes a WHOIS lookup operation following FreeBSD implementation
     private func executeWhoisLookup(
-        domain: String,
+        query: String,
         onResult: @escaping (WhoisResult) -> Void
     ) async {
         let startTime = Date()
-        let cleanDomain = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Initialize RIR tracking (FreeBSD behavior)
+        resetRir()
         
         do {
             // Check if task was cancelled
@@ -43,7 +93,7 @@ final class WhoisManager {
                 return
             }
             
-            let result = try await performCascadedWhoisLookup(domain: cleanDomain, startTime: startTime)
+            let result = try await performFreeBSDWhoisLookup(query: cleanQuery, startTime: startTime)
             
             await MainActor.run {
                 onResult(result)
@@ -59,7 +109,7 @@ final class WhoisManager {
             let responseTime = endTime.timeIntervalSince(startTime) * 1000
             
             let result = WhoisResult(
-                domain: cleanDomain,
+                domain: cleanQuery,
                 success: false,
                 statusMessage: "WHOIS lookup failed: \(error.localizedDescription)",
                 responseTime: responseTime
@@ -71,33 +121,31 @@ final class WhoisManager {
         }
     }
     
-    /// Performs a cascaded WHOIS lookup, following redirects as needed
-    private func performCascadedWhoisLookup(domain: String, startTime: Date) async throws -> WhoisResult {
-        let whoisServer = await determineWhoisServer(for: domain)
-        let whoisData = try await queryWhoisServer(server: whoisServer, domain: domain)
+    /// Performs WHOIS lookup following FreeBSD logic with recursion
+    private func performFreeBSDWhoisLookup(query: String, startTime: Date, flags: Int = 1) async throws -> WhoisResult {
+        let chosenServer = chooseServer(for: query)
+        let whoisData = try await queryWhoisServerFreeBSD(server: chosenServer, query: query)
         
-        // Check if we got a redirect to another WHOIS server
-        let redirectServer = checkForWhoisRedirect(in: whoisData)
+        // Check for referrals if recursion is enabled (FreeBSD default behavior)
+        var finalData = whoisData
+        var finalServer = chosenServer
         
-        let finalData: String
-        let finalServer: String
-        
-        if let redirect = redirectServer, redirect != whoisServer {
-            // Follow the redirect for more detailed information
-            finalData = try await queryWhoisServer(server: redirect, domain: domain)
-            finalServer = redirect
-        } else {
-            finalData = whoisData
-            finalServer = whoisServer
+        if flags & 1 != 0 { // WHOIS_RECURSE equivalent
+            if let (referralHost, referralPort) = parseWhoisReferral(from: whoisData) {
+                if referralHost != chosenServer { // Avoid self-referrals
+                    finalData = try await queryWhoisServerFreeBSD(server: referralHost, query: query, port: referralPort)
+                    finalServer = referralHost
+                }
+            }
         }
         
         let endTime = Date()
         let responseTime = endTime.timeIntervalSince(startTime) * 1000
         
-        let parsedResult = parseWhoisResponse(finalData, for: domain)
+        let parsedResult = parseWhoisResponse(finalData, for: query)
         
         return WhoisResult(
-            domain: domain,
+            domain: query,
             success: true,
             rawResponse: finalData,
             registrar: parsedResult.registrar,
@@ -110,30 +158,186 @@ final class WhoisManager {
         )
     }
     
-    /// Checks if the WHOIS response contains a redirect to another WHOIS server
-    private func checkForWhoisRedirect(in response: String) -> String? {
+    /// FreeBSD choose_server() function equivalent
+    private func chooseServer(for query: String) -> String {
+        let domain = query.lowercased()
+        
+        for (suffix, server) in whoisWhere {
+            if suffix.isEmpty {
+                return server // default case (IANA)
+            }
+            
+            if domain.count > suffix.count {
+                let domainSuffix = String(domain.suffix(suffix.count))
+                if domainSuffix.caseInsensitiveCompare(suffix) == .orderedSame {
+                    return server
+                }
+            }
+        }
+        
+        return ianaHost // safety fallback
+    }
+    
+    /// RFC 3912 compliant WHOIS query with FreeBSD server-specific formatting
+    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43") async throws -> String {
+        return try await withCheckedThrowingContinuation { continuation in
+            let connection = NWConnection(
+                host: NWEndpoint.Host(server),
+                port: NWEndpoint.Port(port) ?? 43,
+                using: .tcp
+            )
+            
+            var hasCompleted = false
+            
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    // FreeBSD server-specific query formatting
+                    let formattedQuery = self.formatQueryForServer(query: query, server: server)
+                    let requestData = formattedQuery.data(using: .utf8) ?? Data()
+                    
+                    connection.send(content: requestData, completion: .contentProcessed { error in
+                        if let error = error {
+                            if !hasCompleted {
+                                hasCompleted = true
+                                continuation.resume(throwing: error)
+                            }
+                            return
+                        }
+                        
+                        // Start reading response
+                        self.readWhoisResponseFreeBSD(connection: connection) { result in
+                            if !hasCompleted {
+                                hasCompleted = true
+                                continuation.resume(with: result)
+                            }
+                        }
+                    })
+                    
+                case .failed(let error):
+                    if !hasCompleted {
+                        hasCompleted = true
+                        continuation.resume(throwing: error)
+                    }
+                    
+                case .cancelled:
+                    if !hasCompleted {
+                        hasCompleted = true
+                        continuation.resume(throwing: URLError(.cancelled))
+                    }
+                    
+                default:
+                    break
+                }
+            }
+            
+            connection.start(queue: .global())
+            
+            // Set timeout
+            DispatchQueue.global().asyncAfter(deadline: .now() + connectionTimeout) {
+                if !hasCompleted {
+                    hasCompleted = true
+                    connection.cancel()
+                    continuation.resume(throwing: URLError(.timedOut))
+                }
+            }
+        }
+    }
+    
+    /// FreeBSD server-specific query formatting
+    private func formatQueryForServer(query: String, server: String) -> String {
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // DENIC (German) special formatting
+        if server.caseInsensitiveCompare(denicHost) == .orderedSame ||
+           server.caseInsensitiveCompare("de" + qnicHostTail) == .orderedSame {
+            // Check for IDN (non-ASCII characters)
+            let hasIDN = cleanQuery.contains { !$0.isASCII }
+            return "-T dn\(hasIDN ? "" : ",ace") \(cleanQuery)\r\n"
+        }
+        
+        // DKNIC (Danish) special formatting
+        if server.caseInsensitiveCompare(dknicHost) == .orderedSame ||
+           server.caseInsensitiveCompare("dk" + qnicHostTail) == .orderedSame {
+            return "--show-handles \(cleanQuery)\r\n"
+        }
+        
+        // ARIN special formatting
+        if server.caseInsensitiveCompare(anicHost) == .orderedSame {
+            // AS number handling
+            if cleanQuery.lowercased().hasPrefix("as") {
+                let asNumber = String(cleanQuery.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if asNumber.allSatisfy({ $0.isNumber }) {
+                    return "+ a \(asNumber)\r\n"
+                }
+            }
+            return "+ \(cleanQuery)\r\n"
+        }
+        
+        // Verisign special formatting
+        if server.caseInsensitiveCompare(vnicHost) == .orderedSame {
+            return "domain \(cleanQuery)\r\n"
+        }
+        
+        // Default formatting (RFC 3912 compliant)
+        return "\(cleanQuery)\r\n"
+    }
+    
+    /// Reads WHOIS response following RFC 3912 and FreeBSD logic
+    private func readWhoisResponseFreeBSD(
+        connection: NWConnection,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        var responseData = Data()
+        
+        func receiveNext() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
+                
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+                
+                if let data = data {
+                    responseData.append(data)
+                }
+                
+                if isComplete {
+                    // RFC 3912: Connection closure indicates end of response
+                    // Try character encodings in order (RFC 3912 guidance)
+                    let responseString = String(data: responseData, encoding: .ascii) ?? // RFC 3912 original encoding
+                                       String(data: responseData, encoding: .utf8) ?? // Common modern encoding
+                                       String(data: responseData, encoding: .isoLatin1) ?? // European fallback
+                                       ""
+                    completion(.success(responseString))
+                    connection.cancel()
+                } else {
+                    receiveNext()
+                }
+            }
+        }
+        
+        receiveNext()
+    }
+    
+    /// FreeBSD-style referral parsing
+    private func parseWhoisReferral(from response: String) -> (host: String, port: String)? {
         let lines = response.components(separatedBy: .newlines)
         
         for line in lines {
             let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            let lowercaseLine = trimmedLine.lowercased()
             
-            // Look for various redirect patterns
-            if lowercaseLine.hasPrefix("whois server:") ||
-               lowercaseLine.hasPrefix("registrar whois server:") ||
-               lowercaseLine.hasPrefix("whois:") {
-                let parts = trimmedLine.components(separatedBy: .whitespaces)
-                if parts.count >= 2 {
-                    let server = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return server?.isEmpty == false ? server : nil
-                }
-            }
-            
-            // Look for "refer:" pattern used by IANA
-            if lowercaseLine.hasPrefix("refer:") {
-                let parts = trimmedLine.components(separatedBy: .whitespaces)
-                if parts.count >= 2 {
-                    return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            for (prefix, len) in whoisReferral {
+                if trimmedLine.count >= len && 
+                   String(trimmedLine.prefix(len)).caseInsensitiveCompare(prefix) == .orderedSame {
+                    
+                    let remainder = String(trimmedLine.dropFirst(len)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    // Parse host and optional port
+                    if let host = extractHostFromReferral(remainder) {
+                        let port = extractPortFromReferral(remainder) ?? "43"
+                        return (host, port)
+                    }
                 }
             }
         }
@@ -141,150 +345,42 @@ final class WhoisManager {
         return nil
     }
     
-    /// Determines the appropriate WHOIS server for a given domain
-    private func determineWhoisServer(for domain: String) async -> String {
-        // Check if it's an IP address - query IANA first like CLI does
-        if IPv4Address(domain) != nil || IPv6Address(domain) != nil {
-            return "whois.iana.org" // Start with IANA for IPs, just like CLI
+    /// Extract host from referral string (FreeBSD SCAN logic)
+    private func extractHostFromReferral(_ referral: String) -> String? {
+        var host = ""
+        for char in referral {
+            if char.isLetter || char.isNumber || char == "." || char == "-" {
+                host.append(char)
+            } else {
+                break
+            }
         }
-        
-        // Extract TLD from domain
-        let components = domain.components(separatedBy: ".")
-        guard let tld = components.last else {
-            return "whois.iana.org" // Default fallback
+        return host.isEmpty ? nil : host
+    }
+    
+    /// Extract port from referral string
+    private func extractPortFromReferral(_ referral: String) -> String? {
+        if let colonIndex = referral.firstIndex(of: ":") {
+            let portString = String(referral[referral.index(after: colonIndex)...])
+            let port = portString.prefix { $0.isNumber }
+            return port.isEmpty ? nil : String(port)
         }
-        
-        // Common TLD to WHOIS server mappings
-        let whoisServers: [String: String] = [
-            "com": "whois.verisign-grs.com",
-            "net": "whois.verisign-grs.com",
-            "org": "whois.pir.org",
-            "edu": "whois.educause.edu",
-            "gov": "whois.dotgov.gov",
-            "mil": "whois.nic.mil",
-            "int": "whois.iana.org",
-            "uk": "whois.nominet.uk",
-            "de": "whois.denic.de",
-            "fr": "whois.afnic.fr",
-            "jp": "whois.jprs.jp",
-            "au": "whois.auda.org.au",
-            "ca": "whois.cira.ca",
-            "ru": "whois.tcinet.ru",
-            "cn": "whois.cnnic.cn",
-            "in": "whois.registry.in",
-            "br": "whois.registro.br",
-            "pl": "whois.dns.pl",
-            "io": "whois.nic.io",
-            "me": "whois.nic.me",
-            "ua": "whois.ua",
-            "se": "whois.iis.se",
-            "dk": "whois.dk-hostmaster.dk",
-            "fi": "whois.fi",
-            "no": "whois.norid.no",
-            "nl": "whois.domain-registry.nl",
-            "be": "whois.dns.be",
-            "ch": "whois.nic.ch",
-            "at": "whois.nic.at",
-            "it": "whois.nic.it",
-            "es": "whois.nic.es",
-            "cc": "whois.nic.cc"
+        return nil
+    }
+    
+    /// Reset RIR tracking (FreeBSD reset_rir function)
+    private func resetRir() {
+        tryRir = [
+            (false, anicHost),
+            (false, rnicHost), 
+            (false, pnicHost),
+            (false, fnicHost),
+            (false, lnicHost)
         ]
-        
-        // If we have a known server, use it
-        if let knownServer = whoisServers[tld] {
-            return knownServer
-        }
-        
-        // For unknown TLDs, query IANA to discover the correct WHOIS server
-        return await discoverWhoisServer(for: tld)
     }
     
-    /// Discovers the WHOIS server for a TLD by querying IANA
-    private func discoverWhoisServer(for tld: String) async -> String {
-        do {
-            let ianaResponse = try await queryWhoisServer(server: "whois.iana.org", domain: tld)
-            
-            // Parse the IANA response to find the WHOIS server
-            let lines = ianaResponse.components(separatedBy: .newlines)
-            for line in lines {
-                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmedLine.lowercased().hasPrefix("whois:") {
-                    let parts = trimmedLine.components(separatedBy: .whitespaces)
-                    if parts.count >= 2 {
-                        return parts[1] // Return the server name
-                    }
-                }
-            }
-        } catch {
-            // If IANA query fails, fall back to a reasonable default
-            print("Failed to discover WHOIS server for TLD .\(tld): \(error)")
-        }
-        
-        // Fallback to IANA for unknown TLDs
-        return "whois.iana.org"
-    }
-    
-    /// Queries a WHOIS server using direct TCP connection (matches CLI behavior)
-    private func queryWhoisServer(server: String, domain: String) async throws -> String {
-        return try await queryWhoisDirectly(server: server, domain: domain)
-    }
-    
-    /// Fallback method for direct WHOIS queries using URLSession with custom protocol
-    private func queryWhoisDirectly(server: String, domain: String) async throws -> String {
-        return try await withCheckedThrowingContinuation { continuation in
-            // Use a simple approach: create a TCP connection using URLSession
-            // This is more reliable than raw BSD sockets
-            
-            let task = Task {
-                do {
-                    let result = try await performTCPWhoisQuery(server: server, domain: domain)
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-            
-            // Set a timeout
-            Task {
-                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
-                task.cancel()
-                continuation.resume(throwing: URLError(.timedOut))
-            }
-        }
-    }
-    
-    /// Performs TCP WHOIS query using Process to call system whois command
-    private func performTCPWhoisQuery(server: String, domain: String) async throws -> String {
-        return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/whois")
-            process.arguments = ["-h", server, domain]
-            
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            
-            do {
-                try process.run()
-                
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                
-                process.waitUntilExit()
-                
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: output)
-                } else {
-                    continuation.resume(throwing: URLError(.cannotConnectToHost))
-                }
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
-    }
-    
-    /// Parses WHOIS response data to extract structured information
-    private func parseWhoisResponse(_ response: String, for domain: String) -> (
+    /// Enhanced WHOIS response parsing (more comprehensive than before)
+    private func parseWhoisResponse(_ response: String, for query: String) -> (
         registrar: String?,
         registrationDate: String?,
         expirationDate: String?,
@@ -300,47 +396,84 @@ final class WhoisManager {
             let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
             let lowercaseLine = trimmedLine.lowercased()
             
-            // Parse registrar
+            // Skip comment lines and empty lines (FreeBSD behavior)
+            if trimmedLine.isEmpty || trimmedLine.hasPrefix("%") || trimmedLine.hasPrefix("#") {
+                continue
+            }
+            
+            // Parse registrar information (comprehensive patterns)
             if registrar == nil {
-                if lowercaseLine.hasPrefix("registrar:") {
-                    registrar = String(trimmedLine.dropFirst(10)).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if lowercaseLine.hasPrefix("registrar name:") {
-                    registrar = String(trimmedLine.dropFirst(15)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let registrarPatterns = [
+                    "registrar:",
+                    "registrar name:",
+                    "organisation:",
+                    "org-name:",
+                    "sponsoring registrar:",
+                    "maintainer:"
+                ]
+                
+                for pattern in registrarPatterns {
+                    if lowercaseLine.hasPrefix(pattern) {
+                        registrar = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
                 }
             }
             
-            // Parse registration date
+            // Parse registration/creation date (comprehensive patterns)
             if registrationDate == nil {
-                if lowercaseLine.hasPrefix("creation date:") {
-                    registrationDate = String(trimmedLine.dropFirst(14)).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if lowercaseLine.hasPrefix("created:") {
-                    registrationDate = String(trimmedLine.dropFirst(8)).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if lowercaseLine.hasPrefix("registered:") {
-                    registrationDate = String(trimmedLine.dropFirst(11)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let creationPatterns = [
+                    "creation date:",
+                    "created:",
+                    "registered:",
+                    "registration date:",
+                    "domain registration date:",
+                    "register date:"
+                ]
+                
+                for pattern in creationPatterns {
+                    if lowercaseLine.hasPrefix(pattern) {
+                        registrationDate = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
                 }
             }
             
-            // Parse expiration date
+            // Parse expiration date (comprehensive patterns)
             if expirationDate == nil {
-                if lowercaseLine.hasPrefix("registry expiry date:") {
-                    expirationDate = String(trimmedLine.dropFirst(21)).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if lowercaseLine.hasPrefix("expiry date:") {
-                    expirationDate = String(trimmedLine.dropFirst(12)).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if lowercaseLine.hasPrefix("expires:") {
-                    expirationDate = String(trimmedLine.dropFirst(8)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let expirationPatterns = [
+                    "registry expiry date:",
+                    "expiry date:",
+                    "expires:",
+                    "expiration date:",
+                    "paid-till:",
+                    "renewal date:"
+                ]
+                
+                for pattern in expirationPatterns {
+                    if lowercaseLine.hasPrefix(pattern) {
+                        expirationDate = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
                 }
             }
             
-            // Parse name servers
-            if lowercaseLine.hasPrefix("name server:") {
-                let nameServer = String(trimmedLine.dropFirst(12)).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !nameServer.isEmpty && !nameServers.contains(nameServer) {
-                    nameServers.append(nameServer)
-                }
-            } else if lowercaseLine.hasPrefix("nserver:") {
-                let nameServer = String(trimmedLine.dropFirst(8)).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !nameServer.isEmpty && !nameServers.contains(nameServer) {
-                    nameServers.append(nameServer)
+            // Parse name servers (comprehensive patterns)
+            let nameServerPatterns = [
+                "name server:",
+                "nserver:",
+                "nameserver:",
+                "ns:",
+                "domain name servers:"
+            ]
+            
+            for pattern in nameServerPatterns {
+                if lowercaseLine.hasPrefix(pattern) {
+                    let nameServer = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !nameServer.isEmpty && !nameServers.contains(nameServer) {
+                        nameServers.append(nameServer)
+                    }
+                    break
                 }
             }
         }

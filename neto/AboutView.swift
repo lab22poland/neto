@@ -76,7 +76,7 @@ struct AboutView: View {
                             Image(systemName: "doc.text.magnifyingglass")
                                 .foregroundColor(.accentColor)
                                 .frame(width: 20)
-                            Text("WHOIS Tool - Query domain registration information and IP address details")
+                            Text("WHOIS Tool - RFC 3912 compliant queries for domains, IP addresses, AS numbers, and person/organization records (FreeBSD compatible)")
                         }
                         .font(.body)
                     }
