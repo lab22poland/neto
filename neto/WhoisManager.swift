@@ -186,7 +186,8 @@ final class WhoisManager {
             "ch": "whois.nic.ch",
             "at": "whois.nic.at",
             "it": "whois.nic.it",
-            "es": "whois.nic.es"
+            "es": "whois.nic.es",
+            "cc": "whois.nic.cc"
         ]
         
         // If we have a known server, use it
@@ -223,133 +224,107 @@ final class WhoisManager {
         return "whois.iana.org"
     }
     
-    /// Queries a WHOIS server for domain information
+    /// Queries a WHOIS server using a simple HTTP-based approach
     private func queryWhoisServer(server: String, domain: String) async throws -> String {
-        return try await withCheckedThrowingContinuation { continuation in
-            Task {
-                do {
-                    let result = try await performNetworkQuery(server: server, domain: domain)
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
-    
-    /// Performs the actual network query with proper async/await handling
-    private func performNetworkQuery(server: String, domain: String) async throws -> String {
-        let endpoint = NWEndpoint.hostPort(host: .name(server, nil), port: 43)
-        let parameters = NWParameters.tcp
-        parameters.prohibitExpensivePaths = false
-        parameters.prohibitConstrainedPaths = false
-        
-        let connection = NWConnection(to: endpoint, using: parameters)
-        
-        // Set up connection state monitoring
-        let connectionReady = await withCheckedContinuation { continuation in
-            var hasResumed = false
-            
-            connection.stateUpdateHandler = { state in
-                guard !hasResumed else { return }
-                
-                switch state {
-                case .ready:
-                    hasResumed = true
-                    continuation.resume(returning: true)
-                case .failed(let error):
-                    hasResumed = true
-                    continuation.resume(returning: false)
-                case .cancelled:
-                    if !hasResumed {
-                        hasResumed = true
-                        continuation.resume(returning: false)
-                    }
-                default:
-                    break
-                }
-            }
-            
-            connection.start(queue: DispatchQueue(label: "whois.connection"))
-        }
-        
-        guard connectionReady else {
-            connection.cancel()
-            throw URLError(.cannotConnectToHost)
-        }
-        
-        // Send the query
-        let query = "\(domain)\r\n"
-        guard let queryData = query.data(using: .utf8) else {
-            connection.cancel()
+        // Use a WHOIS HTTP gateway service for stability
+        // This avoids the low-level networking issues we've been having
+        let urlString = "https://www.whois.com/whois/\(domain)"
+        guard let url = URL(string: urlString) else {
             throw URLError(.badURL)
         }
         
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: queryData, completion: .contentProcessed { error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
+        let request = URLRequest(url: url, timeoutInterval: 30.0)
+        let (data, _) = try await URLSession.shared.data(for: request)
+        
+        guard let htmlString = String(data: data, encoding: .utf8) else {
+            throw URLError(.badServerResponse)
         }
         
-        // Receive the response
-        let responseData = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            let receivedData = NSMutableData()
-            
-            func receiveNextChunk() {
-                connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
-                    if let error = error {
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    
-                    if let data = data {
-                        receivedData.append(data)
-                    }
-                    
-                    if isComplete {
-                        continuation.resume(returning: Data(receivedData))
-                    } else {
-                        receiveNextChunk()
-                    }
-                }
+        // Extract WHOIS data from HTML response
+        // This is a simplified approach - for a full implementation you'd want to parse the HTML properly
+        if htmlString.contains("No match") || htmlString.contains("not found") {
+            return "No match for \"\(domain.uppercased())\"."
+        }
+        
+        // Try to extract the raw WHOIS data from the HTML
+        if let startRange = htmlString.range(of: "<pre"),
+           let endRange = htmlString.range(of: "</pre>", range: startRange.upperBound..<htmlString.endIndex) {
+            let whoisData = String(htmlString[startRange.upperBound..<endRange.lowerBound])
+            // Remove HTML tags
+            let cleanData = whoisData.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression, range: nil)
+            return cleanData.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // Fallback: try direct TCP connection for known reliable servers
+        return try await queryWhoisDirectly(server: server, domain: domain)
+    }
+    
+    /// Fallback method for direct WHOIS queries using raw TCP
+    private func queryWhoisDirectly(server: String, domain: String) async throws -> String {
+        // Very simple TCP implementation
+        let host = server
+        let port = 43
+        
+        // Create socket
+        let sockfd = socket(AF_INET, SOCK_STREAM, 0)
+        guard sockfd >= 0 else {
+            throw URLError(.cannotConnectToHost)
+        }
+        
+        defer { close(sockfd) }
+        
+        // Set timeout
+        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        
+        // Resolve hostname
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, String(port), &hints, &result)
+        guard status == 0, let addr = result else {
+            throw URLError(.cannotFindHost)
+        }
+        
+        defer { freeaddrinfo(result) }
+        
+        // Connect
+        let connectStatus = connect(sockfd, addr.pointee.ai_addr, addr.pointee.ai_addrlen)
+        guard connectStatus == 0 else {
+            throw URLError(.cannotConnectToHost)
+        }
+        
+        // Send query
+        let query = "\(domain)\r\n"
+        let queryData = query.data(using: .utf8)!
+        let sent = queryData.withUnsafeBytes { bytes in
+            send(sockfd, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, 0)
+        }
+        
+        guard sent > 0 else {
+            throw URLError(.networkConnectionLost)
+        }
+        
+        // Receive response
+        var responseData = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        
+        while true {
+            let received = recv(sockfd, &buffer, buffer.count, 0)
+            if received <= 0 {
+                break
             }
-            
-            receiveNextChunk()
+            responseData.append(contentsOf: buffer[0..<received])
         }
-        
-        connection.cancel()
         
         guard let responseString = String(data: responseData, encoding: .utf8) else {
             throw URLError(.badServerResponse)
         }
         
         return responseString
-    }
-    
-    /// Safe state management for network operations
-    private class NetworkState {
-        private let lock = NSLock()
-        private var _hasCompleted = false
-        
-        var hasCompleted: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return _hasCompleted
-        }
-        
-        func markCompleted() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            if _hasCompleted {
-                return false // Already completed
-            }
-            _hasCompleted = true
-            return true // Successfully marked as completed
-        }
     }
     
     /// Parses WHOIS response data to extract structured information
