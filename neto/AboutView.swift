@@ -71,6 +71,14 @@ struct AboutView: View {
                             Text("Traceroute Tool - Discover the network path to a destination")
                         }
                         .font(.body)
+                        
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .foregroundColor(.accentColor)
+                                .frame(width: 20)
+                            Text("WHOIS Tool - Query domain registration information and IP address details")
+                        }
+                        .font(.body)
                     }
                 }
                 
