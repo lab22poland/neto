@@ -72,6 +72,11 @@ final class WhoisViewModel: ObservableObject {
         }
     }
     
+    /// Sets the target domain for testing purposes
+    func setTargetDomain(_ domain: String) {
+        targetDomain = domain
+    }
+    
     /// Checks if the target domain input is valid
     var isTargetDomainValid: Bool {
         let domain = targetDomain.trimmingCharacters(in: .whitespacesAndNewlines)
