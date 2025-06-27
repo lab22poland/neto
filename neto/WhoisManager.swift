@@ -129,62 +129,76 @@ final class WhoisManager {
         return whoisServers[tld] ?? "whois.internic.net"
     }
     
+    /// Safe state management for network operations
+    private class NetworkState {
+        private let lock = NSLock()
+        private var _hasCompleted = false
+        
+        var hasCompleted: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _hasCompleted
+        }
+        
+        func markCompleted() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if _hasCompleted {
+                return false // Already completed
+            }
+            _hasCompleted = true
+            return true // Successfully marked as completed
+        }
+    }
+    
     /// Queries a WHOIS server for domain information
     private func queryWhoisServer(server: String, domain: String) async throws -> String {
         return try await withTaskCancellationHandler {
             return try await withCheckedThrowingContinuation { continuation in
                 let queue = DispatchQueue(label: "whois.query")
-                
                 let endpoint = NWEndpoint.hostPort(host: .name(server, nil), port: 43)
                 let parameters = NWParameters.tcp
                 parameters.prohibitExpensivePaths = false
                 parameters.prohibitConstrainedPaths = false
                 
                 let connection = NWConnection(to: endpoint, using: parameters)
-                let hasCompleted = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
-                hasCompleted.initialize(to: false)
-                defer { 
-                    hasCompleted.deinitialize(count: 1)
-                    hasCompleted.deallocate()
-                }
-                let lock = NSLock()
+                let state = NetworkState()
                 let receivedData = NSMutableData()
                 
-                connection.stateUpdateHandler = { [self] state in
-                    lock.lock()
-                    defer { lock.unlock() }
+                connection.stateUpdateHandler = { connectionState in
+                    guard !state.hasCompleted else { return }
                     
-                    guard !hasCompleted.pointee else { return }
-                    
-                    switch state {
+                    switch connectionState {
                     case .ready:
                         // Send the domain query
                         let query = "\(domain)\r\n"
                         if let queryData = query.data(using: .utf8) {
                             connection.send(content: queryData, completion: .contentProcessed { error in
-                                if let error = error {
-                                    lock.lock()
-                                    if !hasCompleted.pointee {
-                                        hasCompleted.pointee = true
-                                        connection.cancel()
-                                        continuation.resume(throwing: error)
-                                    }
-                                    lock.unlock()
+                                if let error = error, state.markCompleted() {
+                                    connection.cancel()
+                                    continuation.resume(throwing: error)
                                 }
                             })
                             
                             // Start receiving data
-                            receiveData(connection: connection, continuation: continuation, hasCompleted: hasCompleted, lock: lock, receivedData: receivedData)
+                            self.receiveData(
+                                connection: connection,
+                                continuation: continuation,
+                                state: state,
+                                receivedData: receivedData
+                            )
                         }
                         
                     case .failed(let error):
-                        hasCompleted.pointee = true
-                        connection.cancel()
-                        continuation.resume(throwing: error)
+                        if state.markCompleted() {
+                            connection.cancel()
+                            continuation.resume(throwing: error)
+                        }
                         
                     case .cancelled:
-                        hasCompleted.pointee = true
-                        continuation.resume(throwing: URLError(.cancelled))
+                        if state.markCompleted() {
+                            continuation.resume(throwing: URLError(.cancelled))
+                        }
                         
                     default:
                         break
@@ -195,13 +209,10 @@ final class WhoisManager {
                 
                 // Timeout after 30 seconds
                 DispatchQueue.global().asyncAfter(deadline: .now() + 30.0) {
-                    lock.lock()
-                    defer { lock.unlock() }
-                    
-                    guard !hasCompleted.pointee else { return }
-                    hasCompleted.pointee = true
-                    connection.cancel()
-                    continuation.resume(throwing: URLError(.timedOut))
+                    if state.markCompleted() {
+                        connection.cancel()
+                        continuation.resume(throwing: URLError(.timedOut))
+                    }
                 }
             }
         } onCancel: {
@@ -213,18 +224,13 @@ final class WhoisManager {
     private func receiveData(
         connection: NWConnection,
         continuation: CheckedContinuation<String, Error>,
-        hasCompleted: UnsafeMutablePointer<Bool>,
-        lock: NSLock,
+        state: NetworkState,
         receivedData: NSMutableData
     ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [self] data, _, isComplete, error in
-            lock.lock()
-            defer { lock.unlock() }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
+            guard !state.hasCompleted else { return }
             
-            guard !hasCompleted.pointee else { return }
-            
-            if let error = error {
-                hasCompleted.pointee = true
+            if let error = error, state.markCompleted() {
                 connection.cancel()
                 continuation.resume(throwing: error)
                 return
@@ -235,17 +241,23 @@ final class WhoisManager {
             }
             
             if isComplete {
-                hasCompleted.pointee = true
-                connection.cancel()
-                
-                if let responseString = String(data: receivedData as Data, encoding: .utf8) {
-                    continuation.resume(returning: responseString)
-                } else {
-                    continuation.resume(returning: "Invalid response encoding")
+                if state.markCompleted() {
+                    connection.cancel()
+                    
+                    if let responseString = String(data: receivedData as Data, encoding: .utf8) {
+                        continuation.resume(returning: responseString)
+                    } else {
+                        continuation.resume(returning: "Invalid response encoding")
+                    }
                 }
             } else {
                 // Continue receiving data
-                receiveData(connection: connection, continuation: continuation, hasCompleted: hasCompleted, lock: lock, receivedData: receivedData)
+                self.receiveData(
+                    connection: connection,
+                    continuation: continuation,
+                    state: state,
+                    receivedData: receivedData
+                )
             }
         }
     }
