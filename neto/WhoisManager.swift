@@ -143,9 +143,9 @@ final class WhoisManager {
     
     /// Determines the appropriate WHOIS server for a given domain
     private func determineWhoisServer(for domain: String) async -> String {
-        // Check if it's an IP address
+        // Check if it's an IP address - query IANA first like CLI does
         if IPv4Address(domain) != nil || IPv6Address(domain) != nil {
-            return "whois.arin.net" // Default for IP addresses
+            return "whois.iana.org" // Start with IANA for IPs, just like CLI
         }
         
         // Extract TLD from domain
@@ -224,38 +224,8 @@ final class WhoisManager {
         return "whois.iana.org"
     }
     
-    /// Queries a WHOIS server using a simple HTTP-based approach
+    /// Queries a WHOIS server using direct TCP connection (matches CLI behavior)
     private func queryWhoisServer(server: String, domain: String) async throws -> String {
-        // Use a WHOIS HTTP gateway service for stability
-        // This avoids the low-level networking issues we've been having
-        let urlString = "https://www.whois.com/whois/\(domain)"
-        guard let url = URL(string: urlString) else {
-            throw URLError(.badURL)
-        }
-        
-        let request = URLRequest(url: url, timeoutInterval: 30.0)
-        let (data, _) = try await URLSession.shared.data(for: request)
-        
-        guard let htmlString = String(data: data, encoding: .utf8) else {
-            throw URLError(.badServerResponse)
-        }
-        
-        // Extract WHOIS data from HTML response
-        // This is a simplified approach - for a full implementation you'd want to parse the HTML properly
-        if htmlString.contains("No match") || htmlString.contains("not found") {
-            return "No match for \"\(domain.uppercased())\"."
-        }
-        
-        // Try to extract the raw WHOIS data from the HTML
-        if let startRange = htmlString.range(of: "<pre"),
-           let endRange = htmlString.range(of: "</pre>", range: startRange.upperBound..<htmlString.endIndex) {
-            let whoisData = String(htmlString[startRange.upperBound..<endRange.lowerBound])
-            // Remove HTML tags
-            let cleanData = whoisData.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression, range: nil)
-            return cleanData.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        
-        // Fallback: try direct TCP connection for known reliable servers
         return try await queryWhoisDirectly(server: server, domain: domain)
     }
     
