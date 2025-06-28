@@ -7,10 +7,15 @@
 //
 
 import SwiftUI
+import Foundation
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 struct ArpView: View {
     @StateObject private var viewModel = ArpViewModel()
-    @State private var showRawOutput = false
     
     var body: some View {
         VStack(spacing: 20) {
@@ -77,16 +82,16 @@ struct ArpView: View {
             .disabled(viewModel.isLoading)
             .buttonStyle(.borderedProminent)
             
-            Button(action: {
-                showRawOutput.toggle()
-            }) {
-                HStack {
-                    Image(systemName: showRawOutput ? "table" : "terminal")
-                    Text(showRawOutput ? "Table View" : "Raw Output")
+            if !viewModel.currentEntries.isEmpty {
+                Button(action: copyTableContent) {
+                    HStack {
+                        Image(systemName: "doc.on.clipboard")
+                        Text("Copy Table")
+                    }
+                    .frame(minWidth: 120, minHeight: 32)
                 }
-                .frame(minWidth: 120, minHeight: 32)
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
             
             Spacer()
         }
@@ -113,44 +118,51 @@ struct ArpView: View {
     }
     
     private var interfaceTabsSection: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(viewModel.availableTabs, id: \.self) { interface in
-                    interfaceTabButton(for: interface)
-                }
+        // Always use segmented picker - it's the most native approach
+        Picker("Interface", selection: Binding(
+            get: { viewModel.selectedInterface },
+            set: { viewModel.selectInterface($0) }
+        )) {
+            ForEach(viewModel.availableTabs, id: \.self) { interface in
+                Text(interface != "All" || viewModel.totalEntries > 0 ? 
+                     "\(interface) (\(viewModel.entryCountForInterface(interface)))" : 
+                     interface)
+                .tag(interface)
             }
-            .padding(.horizontal, 8)
         }
+        .pickerStyle(.segmented)
+        .padding(.horizontal)
     }
     
-    private func interfaceTabButton(for interface: String) -> some View {
-        Button(action: {
-            viewModel.selectInterface(interface)
-        }) {
-            HStack(spacing: 4) {
-                Text(interface)
-                    .font(.system(.caption, design: .monospaced))
-                    .fontWeight(viewModel.selectedInterface == interface ? .semibold : .regular)
-                
-                if interface != "All" || viewModel.totalEntries > 0 {
-                    Text("(\(viewModel.entryCountForInterface(interface)))")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(viewModel.selectedInterface == interface ? Color.accentColor : .clear)
-            )
-            .foregroundColor(viewModel.selectedInterface == interface ? .white : .primary)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(.tertiary, lineWidth: 1)
-            )
+
+    
+    private func copyTableContent() {
+        var content = "ARP Entries (\(viewModel.selectedInterface))\n\n"
+        
+        // Add header
+        if viewModel.selectedInterface == "All" {
+            content += "IP Address\t\tMAC Address\t\tInterface\t\tStatus\n"
+        } else {
+            content += "IP Address\t\tMAC Address\t\tStatus\n"
         }
-        .buttonStyle(.plain)
+        content += String(repeating: "=", count: 60) + "\n"
+        
+        // Add entries
+        for entry in viewModel.currentEntries {
+            if viewModel.selectedInterface == "All" {
+                content += "\(entry.ipAddress)\t\t\(entry.macAddress)\t\t\(entry.interface)\t\t\(entry.status)\n"
+            } else {
+                content += "\(entry.ipAddress)\t\t\(entry.macAddress)\t\t\(entry.status)\n"
+            }
+        }
+        
+        // Copy to clipboard
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(content, forType: .string)
+#else
+        UIPasteboard.general.string = content
+#endif
     }
     
     @ViewBuilder
@@ -176,27 +188,12 @@ struct ArpView: View {
                 Text("ARP Entries (\(viewModel.selectedInterface))")
                     .font(.headline)
                 
-                if showRawOutput {
-                    rawOutputView
-                } else {
-                    tableOutputView
-                }
+                tableOutputView
             }
         }
     }
     
-    @ViewBuilder
-    private var rawOutputView: some View {
-        ScrollView {
-            Text(viewModel.arpResult?.commandLineOutput(for: viewModel.selectedInterface) ?? "")
-                .font(.system(.caption, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                .textSelection(.enabled)
-        }
-        .frame(maxHeight: 400)
-    }
+
     
     @ViewBuilder
     private var tableOutputView: some View {
