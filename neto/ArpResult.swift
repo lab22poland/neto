@@ -34,6 +34,12 @@ struct ArpEntry: Identifiable, Hashable {
     var description: String {
         "\(ipAddress) -> \(macAddress) (\(interface)) [\(status)]"
     }
+    
+    /// Formats the entry to match 'arp -an' command output
+    var commandLineFormat: String {
+        let statusPart = isPermanent ? "ifscope permanent" : "ifscope"
+        return "? (\(ipAddress)) at \(macAddress) on \(interface) \(statusPart) [ethernet]"
+    }
 }
 
 /// Container for ARP table results grouped by interface
@@ -56,5 +62,22 @@ struct ArpResult {
         self.allEntries = entries
         self.entriesByInterface = Dictionary(grouping: entries) { $0.interface }
         self.timestamp = Date()
+    }
+    
+    /// Returns all entries formatted as command-line output (like 'arp -an')
+    var commandLineOutput: String {
+        return allEntries
+            .sorted { ($0.ipAddress, $0.interface) < ($1.ipAddress, $1.interface) }
+            .map { $0.commandLineFormat }
+            .joined(separator: "\n")
+    }
+    
+    /// Returns entries for a specific interface formatted as command-line output
+    func commandLineOutput(for interface: String) -> String {
+        let entries = interface == "All" ? allEntries : (entriesByInterface[interface] ?? [])
+        return entries
+            .sorted { $0.ipAddress < $1.ipAddress }
+            .map { $0.commandLineFormat }
+            .joined(separator: "\n")
     }
 } 

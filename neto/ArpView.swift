@@ -10,6 +10,7 @@ import SwiftUI
 
 struct ArpView: View {
     @StateObject private var viewModel = ArpViewModel()
+    @State private var showRawOutput = false
     
     var body: some View {
         VStack(spacing: 20) {
@@ -75,6 +76,17 @@ struct ArpView: View {
             }
             .disabled(viewModel.isLoading)
             .buttonStyle(.borderedProminent)
+            
+            Button(action: {
+                showRawOutput.toggle()
+            }) {
+                HStack {
+                    Image(systemName: showRawOutput ? "table" : "terminal")
+                    Text(showRawOutput ? "Table View" : "Raw Output")
+                }
+                .frame(minWidth: 120, minHeight: 32)
+            }
+            .buttonStyle(.bordered)
             
             Spacer()
         }
@@ -164,22 +176,45 @@ struct ArpView: View {
                 Text("ARP Entries (\(viewModel.selectedInterface))")
                     .font(.headline)
                 
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        // Header row
-                        arpTableHeader
-                        
-                        // Data rows
-                        ForEach(viewModel.currentEntries) { entry in
-                            arpEntryRow(for: entry)
-                        }
-                    }
-                    .background(Color(red: 0.95, green: 0.95, blue: 0.97))
-                    .cornerRadius(8)
+                if showRawOutput {
+                    rawOutputView
+                } else {
+                    tableOutputView
                 }
-                .frame(maxHeight: 400)
             }
         }
+    }
+    
+    @ViewBuilder
+    private var rawOutputView: some View {
+        ScrollView {
+            Text(viewModel.arpResult?.commandLineOutput(for: viewModel.selectedInterface) ?? "")
+                .font(.system(.caption, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color(red: 0.95, green: 0.95, blue: 0.97))
+                .cornerRadius(8)
+                .textSelection(.enabled)
+        }
+        .frame(maxHeight: 400)
+    }
+    
+    @ViewBuilder
+    private var tableOutputView: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                // Header row
+                arpTableHeader
+                
+                // Data rows
+                ForEach(viewModel.currentEntries) { entry in
+                    arpEntryRow(for: entry)
+                }
+            }
+            .background(Color(red: 0.95, green: 0.95, blue: 0.97))
+            .cornerRadius(8)
+        }
+        .frame(maxHeight: 400)
     }
     
     private var arpTableHeader: some View {

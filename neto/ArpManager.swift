@@ -21,7 +21,7 @@ final class ArpManager {
             let errorPipe = Pipe()
             
             process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
-            process.arguments = ["-a"]
+            process.arguments = ["-an"]
             process.standardOutput = pipe
             process.standardError = errorPipe
             
@@ -58,7 +58,7 @@ final class ArpManager {
         }
     }
     
-    /// Parses the output of the 'arp -a' command
+    /// Parses the output of the 'arp -an' command
     /// - Parameter output: Raw output from the arp command
     /// - Returns: ArpResult with parsed entries
     /// - Throws: ArpError if parsing fails
@@ -79,17 +79,17 @@ final class ArpManager {
     }
     
     /// Parses a single line of ARP output
-    /// - Parameter line: A single line from arp -a output
+    /// - Parameter line: A single line from arp -an output
     /// - Returns: ArpEntry if parsing succeeds, nil otherwise
     private func parseArpLine(_ line: String) -> ArpEntry? {
-        // Expected formats:
-        // hostname (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
-        // ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
-        // ? (192.168.1.1) at (incomplete) on en0 ifscope [ethernet]
-        // gateway.local (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 permanent [ethernet]
+        // Expected formats from 'arp -an':
+        // ? (10.225.22.1) at 9c:5:d6:47:84:db on en0 ifscope [ethernet]
+        // ? (10.225.22.45) at (incomplete) on en1 ifscope [ethernet]
+        // ? (10.225.22.130) at 5c:1b:f4:8c:6e:be on en0 ifscope permanent [ethernet]
+        // ? (224.0.0.251) at 1:0:5e:0:0:fb on en0 ifscope permanent [ethernet]
         
-        // Use regex to extract components
-        let pattern = #"^.*\(([^)]+)\)\s+at\s+([^\s]+)\s+on\s+([^\s]+)(?:\s+([^[]+))?"#
+        // Regex pattern to match arp -an output exactly
+        let pattern = #"^\?\s+\(([^)]+)\)\s+at\s+([^\s]+)\s+on\s+([^\s]+)\s+ifscope(?:\s+(permanent))?\s+\[([^\]]+)\]"#
         
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
             return nil
@@ -106,20 +106,15 @@ final class ArpManager {
         let macAddress = nsString.substring(with: match.range(at: 2))
         let interface = nsString.substring(with: match.range(at: 3))
         
-        // Extract status information
-        var status = "active"
-        if match.numberOfRanges > 4 && match.range(at: 4).location != NSNotFound {
-            let statusString = nsString.substring(with: match.range(at: 4)).trimmingCharacters(in: .whitespaces)
-            if !statusString.isEmpty {
-                status = statusString
-            }
-        }
-        
-        // Check for special cases in the MAC address field
+        // Determine status based on MAC address and permanent flag
+        var status: String
         if macAddress == "(incomplete)" {
             status = "incomplete"
-        } else if line.contains("permanent") {
+        } else if match.numberOfRanges > 4 && match.range(at: 4).location != NSNotFound {
+            // Check if "permanent" is present
             status = "permanent"
+        } else {
+            status = "active"
         }
         
         // Validate MAC address format (unless incomplete)
