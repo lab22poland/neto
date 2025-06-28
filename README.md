@@ -12,9 +12,16 @@ NETo (Network Engineer Tools) brings professional-grade network utilities to you
 
 ### 🔍 Network Diagnostics
 - **Ping Tool**: Advanced ping functionality with real-time results
+- **Traceroute Tool**: Network path discovery and hop-by-hop analysis
+- **WHOIS Tool**: RFC 3912 compliant queries (FreeBSD whois.c compatible)
+  - Domain registration information (gTLDs, ccTLDs, new gTLDs)
+  - IP address allocation details (IPv4/IPv6 with RIR routing)
+  - AS number information and network prefixes
+  - Person/organization contact records
+  - Direct TCP port 43 connections with proper server selection
 - **Network Reachability**: Test connectivity to any host or IP address
 - **Multi-protocol Support**: UDP and TCP connectivity testing
-- **Detailed Results**: Comprehensive ping statistics and error reporting
+- **Detailed Results**: Comprehensive statistics and error reporting
 
 ### 📱 Multiplatform Support
 - **iPhone**: Optimized portrait and landscape interfaces
@@ -39,6 +46,14 @@ NETo (Network Engineer Tools) brings professional-grade network utilities to you
 - **Data Persistence**: SwiftData for cross-platform compatibility
 - **Network Stack**: Network.framework for modern networking
 - **Async/Await**: Modern Swift concurrency for responsive UI
+
+### WHOIS Implementation Standards
+- **RFC 3912 Compliance**: Direct TCP port 43 connections
+- **FreeBSD Compatibility**: Exact server selection logic from FreeBSD whois.c
+- **Multi-Object Support**: Domains, IP addresses, AS numbers, person/org records
+- **Character Encoding**: UTF-8, ASCII, and ISO-Latin-1 fallback support
+- **Server-Specific Formatting**: Proper query formatting for different WHOIS servers
+- **Referral Following**: Automatic redirect detection and recursion
 
 ### Bundle Information
 - **Bundle Identifier**: `pl.lab22.neto`
@@ -83,6 +98,22 @@ open neto.xcodeproj
 4. Tap "Start Ping" to begin connectivity testing
 5. View real-time results and statistics
 
+### Traceroute Tool
+1. Select "Traceroute" from the main menu
+2. Enter destination hostname or IP address
+3. Tap "Start Traceroute" to trace network path
+4. Monitor hop-by-hop progress and latency
+
+### WHOIS Tool
+1. Navigate to "WHOIS" from the main menu
+2. Enter query target:
+   - **Domains**: `google.com`, `example.org`
+   - **IP Addresses**: `8.8.8.8`, `2001:4860:4860::8888`
+   - **AS Numbers**: `AS15169`, `AS32934`
+   - **Contacts**: Person/organization handles
+3. Tap "Perform WHOIS Lookup" to query registration information
+4. View detailed results including registrar, dates, name servers, and network details
+
 ### Network Testing
 - Test both IPv4 and IPv6 addresses
 - Monitor connection latency and success rates
@@ -110,6 +141,11 @@ neto/                         # Xcode project directory (current location)
 
 ### Key Components
 - **PingView**: Advanced network connectivity testing
+- **TracerouteView**: Network path discovery and analysis
+- **WhoisView & WhoisManager**: RFC 3912 compliant WHOIS queries
+  - FreeBSD whois.c compatible implementation
+  - Multi-object support (domains, IPs, AS numbers, contacts)
+  - Direct TCP port 43 connections with server-specific formatting
 - **Network Framework**: Modern networking with proper error handling
 - **SwiftUI Navigation**: Platform-adaptive interface design
 - **Entitlements**: Secure network access permissions
@@ -146,9 +182,16 @@ See [LICENSE](LICENSE) file for complete license terms.
 
 ## 🔮 Roadmap
 
-- [ ] **Traceroute Tool**: Network path analysis
-- [ ] **Port Scanner**: TCP/UDP port connectivity testing  
+### ✅ **Implemented Features**
+- **Ping Tool**: ICMP connectivity testing
+- **Traceroute Tool**: Network path analysis  
+- **WHOIS Tool**: RFC 3912 compliant queries (FreeBSD compatible)
+
+### 🚧 **In Development**
 - [ ] **DNS Lookup**: Domain name resolution tools
+- [ ] **Port Scanner**: TCP/UDP port connectivity testing
+
+### 📋 **Planned Features**
 - [ ] **ARP Lookup**: Address Resolution Protocol table inspection
 - [ ] **Wake-on-LAN**: Remote device wake-up functionality
 - [ ] **Nmap Integration**: Network mapping and security scanning

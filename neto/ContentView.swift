@@ -22,6 +22,8 @@ struct ContentView: View {
                     PingView()
                 case .traceroute:
                     TracerouteView()
+                case .whois:
+                    WhoisView()
                 case .about:
                     AboutView()
                 }
@@ -67,6 +69,8 @@ struct ToolsList: View {
             PingView()
         case .traceroute:
             TracerouteView()
+        case .whois:
+            WhoisView()
         case .about:
             AboutView()
         }
@@ -77,6 +81,7 @@ struct ToolsList: View {
 enum NetworkTool: String, CaseIterable, Identifiable {
     case ping = "ping"
     case traceroute = "traceroute"
+    case whois = "whois"
     case about = "about"
     
     var id: String { rawValue }
@@ -87,6 +92,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
             return "Ping"
         case .traceroute:
             return "Traceroute"
+        case .whois:
+            return "WHOIS"
         case .about:
             return "About"
         }
@@ -98,6 +105,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
             return "network"
         case .traceroute:
             return "point.topleft.down.curvedto.point.bottomright.up"
+        case .whois:
+            return "doc.text.magnifyingglass"
         case .about:
             return "info.circle"
         }

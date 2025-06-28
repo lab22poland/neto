@@ -71,6 +71,14 @@ struct AboutView: View {
                             Text("Traceroute Tool - Discover the network path to a destination")
                         }
                         .font(.body)
+                        
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .foregroundColor(.accentColor)
+                                .frame(width: 20)
+                            Text("WHOIS Tool - RFC 3912 compliant queries for domains, IP addresses, AS numbers, and person/organization records (FreeBSD compatible)")
+                        }
+                        .font(.body)
                     }
                 }
                 
