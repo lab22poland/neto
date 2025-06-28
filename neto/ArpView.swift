@@ -142,12 +142,12 @@ struct ArpView: View {
             .padding(.vertical, 6)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(viewModel.selectedInterface == interface ? Color.accentColor : Color.clear)
+                    .fill(viewModel.selectedInterface == interface ? Color.accentColor : .clear)
             )
             .foregroundColor(viewModel.selectedInterface == interface ? .white : .primary)
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
+                    .stroke(.tertiary, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -192,8 +192,7 @@ struct ArpView: View {
                 .font(.system(.caption, design: .monospaced))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
-                .background(Color(red: 0.95, green: 0.95, blue: 0.97))
-                .cornerRadius(8)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                 .textSelection(.enabled)
         }
         .frame(maxHeight: 400)
@@ -211,8 +210,7 @@ struct ArpView: View {
                     arpEntryRow(for: entry)
                 }
             }
-            .background(Color(red: 0.95, green: 0.95, blue: 0.97))
-            .cornerRadius(8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
         }
         .frame(maxHeight: 400)
     }
@@ -240,7 +238,7 @@ struct ArpView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color.gray.opacity(0.2))
+        .background(.quaternary)
     }
     
     private func arpEntryRow(for entry: ArpEntry) -> some View {
@@ -273,7 +271,7 @@ struct ArpView: View {
         .overlay(
             Rectangle()
                 .frame(height: 0.5)
-                .foregroundColor(Color.gray.opacity(0.3)),
+                .foregroundStyle(.tertiary),
             alignment: .bottom
         )
     }
