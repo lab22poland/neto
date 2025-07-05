@@ -8,7 +8,9 @@
 
 import SwiftUI
 import Foundation
-import AppKit
+#if !os(macOS)
+import UIKit
+#endif
 
 struct ArpView: View {
     @StateObject private var viewModel = ArpViewModel()
@@ -149,9 +151,13 @@ struct ArpView: View {
             }
         }
         
-        // Copy to clipboard
+        // Copy to clipboard using platform-appropriate method
+        #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(content, forType: .string)
+        #else
+        UIPasteboard.general.string = content
+        #endif
     }
     
     @ViewBuilder

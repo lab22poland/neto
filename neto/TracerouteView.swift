@@ -7,6 +7,9 @@
 //
 
 import SwiftUI
+#if !os(macOS)
+import UIKit
+#endif
 
 struct TracerouteView: View {
     @StateObject private var viewModel = TracerouteViewModel()
@@ -223,9 +226,13 @@ struct TracerouteView: View {
     private func shareResults() {
         let results = viewModel.exportResults()
         
+        #if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(results, forType: .string)
+        #else
+        UIPasteboard.general.string = results
+        #endif
     }
 }
 

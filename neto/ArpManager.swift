@@ -9,7 +9,9 @@
 import Foundation
 import Network
 import SystemConfiguration
+#if os(macOS)
 import Darwin
+#endif
 
 /// Manager class responsible for ARP table operations across all platforms
 /// 
@@ -59,7 +61,12 @@ final class ArpManager {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
+                    #if os(macOS)
                     let entries = try self.getNeighborCacheEntries()
+                    #else
+                    // On iOS/iPadOS, we can only get basic interface information
+                    let entries = try self.getBasicInterfaceEntries()
+                    #endif
                     let result = ArpResult(entries: entries)
                     continuation.resume(returning: result)
                 } catch {
@@ -71,6 +78,7 @@ final class ArpManager {
     
     // MARK: - Core Implementation
     
+    #if os(macOS)
     /// Retrieves neighbor cache entries using BSD sysctl APIs
     private func getNeighborCacheEntries() throws -> [ArpEntry] {
         var entries: [ArpEntry] = []
@@ -382,6 +390,29 @@ final class ArpManager {
         
         return macParts.joined(separator: ":")
     }
+    #endif
+    
+    #if !os(macOS)
+    /// Retrieves basic interface information for iOS/iPadOS
+    /// Note: iOS/iPadOS sandbox restrictions limit access to detailed ARP information
+    private func getBasicInterfaceEntries() throws -> [ArpEntry] {
+        var entries: [ArpEntry] = []
+        
+        // On iOS/iPadOS, we can only get basic network interface information
+        // due to sandbox restrictions that prevent access to detailed ARP tables
+        
+        // Create a basic entry showing that ARP information is limited on iOS/iPadOS
+        let entry = ArpEntry(
+            ipAddress: "N/A",
+            macAddress: "N/A", 
+            interface: "iOS/iPadOS",
+            status: "Limited access due to sandbox restrictions"
+        )
+        entries.append(entry)
+        
+        return entries
+    }
+    #endif
 }
 
 /// Errors that can occur during ARP operations
