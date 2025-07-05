@@ -21,9 +21,6 @@ struct WhoisView: View {
         }
         .padding()
         .navigationTitle("WHOIS")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isLoading {
                 viewModel.stopWhoisLookup()
@@ -52,13 +49,7 @@ struct WhoisView: View {
             
             TextField("Enter domain, IP address, AS number, or person/organization", text: $viewModel.targetQuery)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.isTargetQueryValid && !viewModel.isLoading {
                         viewModel.startWhoisLookup()

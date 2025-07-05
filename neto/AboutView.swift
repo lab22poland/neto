@@ -149,9 +149,6 @@ struct AboutView: View {
             .padding()
         }
         .navigationTitle("About")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
     }
 }
 

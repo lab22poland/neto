@@ -192,7 +192,10 @@ final class SimplePing: NSObject {
         // Determine the address family
         let addressFamily: Int32
         if hostAddress.count >= MemoryLayout<sockaddr_in>.size {
-            let sockaddr = hostAddress.withUnsafeBytes { $0.bindMemory(to: sockaddr.self).baseAddress!.pointee }
+            let sockaddr = hostAddress.withUnsafeBytes { rawBuffer in
+                let ptr = UnsafeRawPointer(rawBuffer.baseAddress!).assumingMemoryBound(to: Darwin.sockaddr.self)
+                return ptr.pointee
+            }
             addressFamily = Int32(sockaddr.sa_family)
         } else {
             addressFamily = AF_INET // Default to IPv4
@@ -209,7 +212,7 @@ final class SimplePing: NSObject {
         
         // Set socket options for non-blocking operation
         var value: Int32 = 1
-        setsockopt(socket, SOL_SOCKET, SO_NONBLOCK, &value, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(socket, SOL_SOCKET, O_NONBLOCK, &value, socklen_t(MemoryLayout<Int32>.size))
         
         // Start receiving responses
         startReceiving()

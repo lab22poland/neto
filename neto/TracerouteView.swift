@@ -23,9 +23,6 @@ struct TracerouteView: View {
         }
         .padding()
         .navigationTitle("Traceroute")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isTracing {
                 viewModel.stopTraceroute()
@@ -96,13 +93,7 @@ struct TracerouteView: View {
             
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.canStartTraceroute {
                         viewModel.startTraceroute()
@@ -232,22 +223,9 @@ struct TracerouteView: View {
     private func shareResults() {
         let results = viewModel.exportResults()
         
-#if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(results, forType: .string)
-#else
-        let activityController = UIActivityViewController(
-            activityItems: [results],
-            applicationActivities: nil
-        )
-        
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let window = windowScene.windows.first,
-           let rootViewController = window.rootViewController {
-            rootViewController.present(activityController, animated: true)
-        }
-#endif
     }
 }
 

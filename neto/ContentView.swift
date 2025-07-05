@@ -12,7 +12,6 @@ struct ContentView: View {
     @State private var selectedTool: NetworkTool? = nil
     
     var body: some View {
-#if os(macOS)
         NavigationSplitView {
             ToolsList(selectedTool: $selectedTool)
         } detail: {
@@ -35,11 +34,6 @@ struct ContentView: View {
             }
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 250)
-#else
-        NavigationStack {
-            ToolsList(selectedTool: $selectedTool)
-        }
-#endif
     }
 }
 
@@ -48,38 +42,12 @@ struct ToolsList: View {
     
     var body: some View {
         List(NetworkTool.allCases, selection: $selectedTool) { tool in
-#if os(macOS)
             Label(tool.title, systemImage: tool.icon)
                 .tag(tool)
-#else
-            NavigationLink(destination: destinationView(for: tool)) {
-                Label(tool.title, systemImage: tool.icon)
-            }
-#endif
         }
         .navigationTitle("NETo")
-#if os(macOS)
         .listStyle(SidebarListStyle())
-#endif
     }
-    
-#if os(iOS)
-    @ViewBuilder
-    private func destinationView(for tool: NetworkTool) -> some View {
-        switch tool {
-        case .ping:
-            PingView()
-        case .traceroute:
-            TracerouteView()
-        case .whois:
-            WhoisView()
-        case .arp:
-            ArpView()
-        case .about:
-            AboutView()
-        }
-    }
-#endif
 }
 
 enum NetworkTool: String, CaseIterable, Identifiable {

@@ -26,9 +26,6 @@ struct PingViewV2: View {
         }
         .padding()
         .navigationTitle("Ping")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isPinging {
                 viewModel.stopPing()
@@ -57,13 +54,7 @@ struct PingViewV2: View {
             
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.isTargetHostValid && !viewModel.isPinging {
                         viewModel.startPing()
@@ -149,7 +140,7 @@ struct PingViewV2: View {
                         }
                     }
                     .padding()
-                    .background(Color(.systemGray6))
+                    .background(Color.gray.opacity(0.1))
                     .cornerRadius(8)
                 }
             }
@@ -233,7 +224,7 @@ struct PingViewV2: View {
                     }
                     .font(.caption)
                     .padding()
-                    .background(Color(.systemGray6))
+                    .background(Color.gray.opacity(0.1))
                     .cornerRadius(8)
                 }
             }

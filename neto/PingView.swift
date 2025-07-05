@@ -21,9 +21,6 @@ struct PingView: View {
         }
         .padding()
         .navigationTitle("Ping")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isPinging {
                 viewModel.stopPing()
@@ -52,13 +49,7 @@ struct PingView: View {
             
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.isTargetHostValid && !viewModel.isPinging {
                         viewModel.startPing()

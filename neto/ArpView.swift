@@ -8,11 +8,7 @@
 
 import SwiftUI
 import Foundation
-#if os(macOS)
 import AppKit
-#else
-import UIKit
-#endif
 
 struct ArpView: View {
     @StateObject private var viewModel = ArpViewModel()
@@ -27,9 +23,6 @@ struct ArpView: View {
         }
         .padding()
         .navigationTitle("ARP")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onAppear {
             viewModel.onAppear()
         }
@@ -157,12 +150,8 @@ struct ArpView: View {
         }
         
         // Copy to clipboard
-#if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(content, forType: .string)
-#else
-        UIPasteboard.general.string = content
-#endif
     }
     
     @ViewBuilder
