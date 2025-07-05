@@ -16,7 +16,7 @@ struct AboutView: View {
                     HStack {
                         Image(systemName: "network")
                             .font(.system(size: 48))
-                            .foregroundColor(.accentColor)
+                            .foregroundColor(.primary)
                         
                         VStack(alignment: .leading) {
                             Text("NETo")
@@ -58,7 +58,7 @@ struct AboutView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Image(systemName: "network")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("Ping Tool - Send ICMP echo packets to test network connectivity")
                         }
@@ -66,7 +66,7 @@ struct AboutView: View {
                         
                         HStack {
                             Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("Traceroute Tool - Discover the network path to a destination")
                         }
@@ -74,7 +74,7 @@ struct AboutView: View {
                         
                         HStack {
                             Image(systemName: "doc.text.magnifyingglass")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("WHOIS Tool - RFC 3912 compliant queries for domains, IP addresses, AS numbers, and person/organization records (FreeBSD compatible)")
                         }
@@ -91,21 +91,21 @@ struct AboutView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Image(systemName: "iphone")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("iPhone (iOS 17.0+)")
                         }
                         
                         HStack {
                             Image(systemName: "ipad")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("iPad (iPadOS 17.0+)")
                         }
                         
                         HStack {
                             Image(systemName: "macbook")
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(.primary)
                                 .frame(width: 20)
                             Text("macOS (14.0+)")
                         }

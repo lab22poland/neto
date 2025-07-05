@@ -82,7 +82,7 @@ struct TracerouteView: View {
             }
         }
         .padding()
-        .background(Color.gray.opacity(0.1))
+        .background(.quaternary)
         .cornerRadius(8)
     }
     
@@ -121,7 +121,7 @@ struct TracerouteView: View {
                             .frame(minWidth: 60, minHeight: 32)
                     }
                     .buttonStyle(.bordered)
-                    .foregroundColor(.red)
+                    .foregroundColor(.secondary)
                 }
                 
                 if !viewModel.tracerouteResults.isEmpty && !viewModel.isTracing {
@@ -146,13 +146,13 @@ struct TracerouteView: View {
             if let errorMessage = viewModel.errorMessage {
                 HStack {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
+                        .foregroundColor(.secondary)
                     Text(errorMessage)
-                        .foregroundColor(.orange)
+                        .foregroundColor(.secondary)
                     Spacer()
                 }
                 .padding()
-                .background(Color.orange.opacity(0.1))
+                .background(.quaternary)
                 .cornerRadius(8)
             }
         }
@@ -177,9 +177,9 @@ struct TracerouteView: View {
                     if viewModel.destinationReached {
                         HStack {
                             Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
+                                .foregroundColor(.primary)
                             Text("Destination reached")
-                                .foregroundColor(.green)
+                                .foregroundColor(.primary)
                                 .font(.caption)
                         }
                     } else if viewModel.isTracing {
@@ -188,7 +188,7 @@ struct TracerouteView: View {
                                 .scaleEffect(0.5)
                                 .frame(width: 10, height: 10)
                             Text("Tracing route...")
-                                .foregroundColor(.blue)
+                                .foregroundColor(.secondary)
                                 .font(.caption)
                         }
                     }
@@ -213,7 +213,7 @@ struct TracerouteView: View {
                         .padding(.vertical, 4)
                     }
                     .frame(maxHeight: 300)
-                    .background(Color.gray.opacity(0.1))
+                    .background(.quaternary)
                     .cornerRadius(8)
                 }
             }
@@ -250,7 +250,7 @@ struct TracerouteResultRow: View {
                 if result.success && result.responseTime > 0 {
                     Text(String(format: "%.2f ms", result.responseTime))
                         .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(.green)
+                        .foregroundColor(.primary)
                 }
             }
             
@@ -277,9 +277,9 @@ struct TracerouteResultRow: View {
     
     private var statusColor: Color {
         if result.isDestination {
-            return .green
+            return .primary
         } else if result.success {
-            return .blue
+            return .primary
         } else {
             return .secondary
         }

@@ -140,7 +140,7 @@ struct PingViewV2: View {
                         }
                     }
                     .padding()
-                    .background(Color.gray.opacity(0.1))
+                    .background(.quaternary)
                     .cornerRadius(8)
                 }
             }
@@ -152,13 +152,13 @@ struct PingViewV2: View {
             if let errorMessage = viewModel.errorMessage {
                 HStack {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.red)
+                        .foregroundColor(.secondary)
                     Text(errorMessage)
-                        .foregroundColor(.red)
+                        .foregroundColor(.secondary)
                     Spacer()
                 }
                 .padding()
-                .background(Color.red.opacity(0.1))
+                .background(.quaternary)
                 .cornerRadius(8)
             }
         }
@@ -208,7 +208,7 @@ struct PingViewV2: View {
                             Text("Packets: \(stats.totalPings) sent, \(stats.successCount) received")
                             Spacer()
                             Text("Loss: \(stats.formattedPacketLoss)")
-                                .foregroundColor(stats.packetLoss > 0 ? .red : .green)
+                                .foregroundColor(stats.packetLoss > 0 ? .secondary : .primary)
                         }
                         
                         HStack {
@@ -224,7 +224,7 @@ struct PingViewV2: View {
                     }
                     .font(.caption)
                     .padding()
-                    .background(Color.gray.opacity(0.1))
+                    .background(.quaternary)
                     .cornerRadius(8)
                 }
             }
@@ -240,7 +240,7 @@ struct PingResultRow: View {
     var body: some View {
         HStack {
             Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundColor(result.success ? .green : .red)
+                .foregroundColor(result.success ? .primary : .secondary)
             
             Text(result.message)
                 .font(.system(.body, design: .monospaced))
