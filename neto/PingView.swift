@@ -21,9 +21,6 @@ struct PingView: View {
         }
         .padding()
         .navigationTitle("Ping")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isPinging {
                 viewModel.stopPing()
@@ -52,13 +49,7 @@ struct PingView: View {
             
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.isTargetHostValid && !viewModel.isPinging {
                         viewModel.startPing()
@@ -95,9 +86,9 @@ struct PingView: View {
     @ViewBuilder
     private var errorSection: some View {
         if let errorMessage = viewModel.errorMessage {
-            Text(errorMessage)
-                .foregroundColor(.red)
-                .font(.caption)
+                    Text(errorMessage)
+            .foregroundColor(.secondary)
+            .font(.caption)
         }
     }
     
@@ -129,11 +120,11 @@ struct PingView: View {
     private func resultRow(for result: PingResult) -> some View {
         HStack {
             Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundColor(result.success ? .green : .red)
+                .foregroundColor(result.success ? .primary : .secondary)
             
             Text(result.message)
                 .font(.system(.body, design: .monospaced))
-                .foregroundColor(result.success ? .primary : .red)
+                .foregroundColor(result.success ? .primary : .secondary)
             
             Spacer()
         }

@@ -8,9 +8,7 @@
 
 import SwiftUI
 import Foundation
-#if os(macOS)
-import AppKit
-#else
+#if !os(macOS)
 import UIKit
 #endif
 
@@ -27,9 +25,6 @@ struct ArpView: View {
         }
         .padding()
         .navigationTitle("ARP")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onAppear {
             viewModel.onAppear()
         }
@@ -100,9 +95,9 @@ struct ArpView: View {
     @ViewBuilder
     private var errorSection: some View {
         if let errorMessage = viewModel.errorMessage {
-            Text(errorMessage)
-                .foregroundColor(.red)
-                .font(.caption)
+                            Text(errorMessage)
+                    .foregroundColor(.secondary)
+                    .font(.caption)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -156,13 +151,13 @@ struct ArpView: View {
             }
         }
         
-        // Copy to clipboard
-#if os(macOS)
+        // Copy to clipboard using platform-appropriate method
+        #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(content, forType: .string)
-#else
+        #else
         UIPasteboard.general.string = content
-#endif
+        #endif
     }
     
     @ViewBuilder
@@ -246,7 +241,7 @@ struct ArpView: View {
                 
                 Text(entry.macAddress)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .foregroundColor(entry.macAddress == "(incomplete)" ? .orange : .primary)
+                    .foregroundColor(entry.macAddress == "(incomplete)" ? .secondary : .primary)
                 
                 if viewModel.selectedInterface == "All" {
                     Text(entry.interface)
@@ -277,15 +272,15 @@ struct ArpView: View {
     private func statusIcon(for entry: ArpEntry) -> some View {
         if entry.isPermanent {
             Image(systemName: "lock.fill")
-                .foregroundColor(.blue)
+                .foregroundColor(.primary)
                 .font(.system(size: 10))
         } else if entry.status.contains("incomplete") {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
+                .foregroundColor(.secondary)
                 .font(.system(size: 10))
         } else {
             Image(systemName: "checkmark.circle.fill")
-                .foregroundColor(.green)
+                .foregroundColor(.primary)
                 .font(.system(size: 10))
         }
     }
