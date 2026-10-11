@@ -7,18 +7,47 @@
 //
 
 import Foundation
-import Network
+import Darwin
 
-/// Manager class responsible for traceroute operations and path discovery
+/// Traces the route to a host with ICMP echo probes and an increasing TTL (hop limit), like `traceroute -I`.
+/// Uses an unprivileged SOCK_DGRAM ICMP socket: routers answer with Time Exceeded, the target with Echo Reply.
+/// IPv6 (ICMPv6, hop limit) follows the same scheme but has not been verified on a live IPv6 network.
 final class TracerouteManager {
-    
-    /// Performs a traceroute operation to the specified host
+
+    /// Echo probes sent per hop
+    static let probesPerHop = 3
+
+    /// A host name or address resolved to a socket address
+    struct ResolvedHost {
+        let address: Data
+        let family: Int32
+        let ipAddress: String
+    }
+
+    /// Syntactic kind of the user's input, checked before any DNS lookup
+    enum HostKind: Equatable {
+        case ipv4, ipv6, name
+    }
+
+    // All mutable state is touched only on the main actor
+    private var socketFD: Int32 = -1
+    private var readSource: DispatchSourceRead?
+    private var family: Int32 = AF_INET
+    private var identifier: UInt16 = 0
+    private var nextSequenceNumber: UInt16 = 0
+    private var sendTimes: [UInt16: Date] = [:]
+    private var replies: [UInt16: (time: Double, address: String, reply: ICMPPacket.ProbeReply)] = [:]
+    private var runTask: Task<Void, Never>?
+
+    // MARK: - Public Methods
+
+    /// Traces the route to the specified host
     /// - Parameters:
     ///   - host: The target host (IP address or domain name)
-    ///   - maxHops: Maximum number of hops to attempt (default: 30)
-    ///   - timeout: Timeout for each hop in seconds (default: 5.0)
-    ///   - onResult: Callback called for each hop result
-    ///   - onComplete: Callback called when traceroute is complete
+    ///   - maxHops: Maximum TTL / hop limit to probe
+    ///   - timeout: Seconds to wait for the replies of one hop
+    ///   - onResult: Called on the main actor with one result per hop; called again with the same `id` when the router's name is resolved
+    ///   - onComplete: Called exactly once when the run ends, including after cancellation
     /// - Returns: A Task that can be cancelled
     func performTraceroute(
         to host: String,
@@ -27,167 +56,77 @@ final class TracerouteManager {
         onResult: @escaping (TracerouteResult) -> Void,
         onComplete: @escaping () -> Void
     ) -> Task<Void, Never> {
-        return Task {
-            await executeTracerouteSequence(
-                host: host,
-                maxHops: maxHops,
-                timeout: timeout,
-                onResult: onResult,
-                onComplete: onComplete
-            )
-        }
-    }
-    
-    /// Executes the traceroute sequence using progressive hop discovery
-    private func executeTracerouteSequence(
-        host: String,
-        maxHops: Int,
-        timeout: TimeInterval,
-        onResult: @escaping (TracerouteResult) -> Void,
-        onComplete: @escaping () -> Void
-    ) async {
-        var reachedDestination = false
-        var targetEndpoint: NWEndpoint?
-        
-        // First, validate and resolve the target host
-        do {
-            targetEndpoint = try await resolveHost(host)
-        } catch {
-            let result = TracerouteResult(
-                hopNumber: 1,
-                success: false,
-                responseTime: 0,
-                message: "Failed to resolve host: \(host) - \(error.localizedDescription)",
-                isDestination: false
-            )
-            await MainActor.run {
-                onResult(result)
-                onComplete()
+        // Runs share the socket state, so a new run waits until the previous (cancelled) one has finished.
+        let previousTask = runTask
+        previousTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { onComplete(); return }
+            await self.trace(host: host, maxHops: maxHops, timeout: timeout) { result in
+                if !Task.isCancelled { onResult(result) }
             }
-            return
-        }
-        
-        // Extract the resolved IP for comparison
-        let targetIP = extractIPAddress(from: targetEndpoint!)
-        
-        // Perform progressive hop discovery (simulating increasing TTL)
-        for hopNumber in 1...maxHops {
-            // Check if task was cancelled
-            if Task.isCancelled {
-                return
-            }
-            
-            let startTime = Date()
-            
-            do {
-                let hopResult = try await discoverNetworkHop(
-                    targetHost: host,
-                    targetIP: targetIP,
-                    hopNumber: hopNumber,
-                    timeout: timeout,
-                    maxHops: maxHops
-                )
-                
-                let endTime = Date()
-                let responseTime = endTime.timeIntervalSince(startTime) * 1000 // Convert to milliseconds
-                
-                let result = TracerouteResult(
-                    hopNumber: hopNumber,
-                    success: hopResult.success,
-                    ipAddress: hopResult.ipAddress,
-                    hostname: hopResult.hostname,
-                    responseTime: responseTime,
-                    message: hopResult.message,
-                    isDestination: hopResult.isDestination
-                )
-                
-                await MainActor.run {
-                    onResult(result)
-                }
-                
-                // If we reached the destination, stop the traceroute
-                if hopResult.isDestination && hopResult.success {
-                    reachedDestination = true
-                    break
-                }
-                
-            } catch {
-                // Check if task was cancelled
-                if Task.isCancelled {
-                    return
-                }
-                
-                let result = TracerouteResult(
-                    hopNumber: hopNumber,
-                    success: false,
-                    responseTime: 0,
-                    message: String(format: "* * * Request timed out"),
-                    isDestination: false
-                )
-                
-                await MainActor.run {
-                    onResult(result)
-                }
-            }
-            
-            // Add delay between hops, but check for cancellation
-            if hopNumber < maxHops && !reachedDestination {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(0.8 * 1_000_000_000)) // 800ms delay
-                } catch {
-                    // Task was cancelled during sleep
-                    return
-                }
-            }
-        }
-        
-        await MainActor.run {
+            self.closeSocket()
             onComplete()
         }
+        runTask = task
+        return task
     }
-    
-    /// Resolves the target host to an endpoint with proper validation
-    func resolveHost(_ host: String) async throws -> NWEndpoint {
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Validate the host is not empty
-        guard !trimmedHost.isEmpty else {
+
+    /// Classifies the input before any network access; throws for malformed addresses and host names
+    func classifyHost(_ host: String) throws -> HostKind {
+        guard !host.isEmpty else {
             throw TracerouteError.invalidHost("Host cannot be empty")
         }
-        
-        // First validate IPv4 format BEFORE trying to parse
-        if trimmedHost.contains(".") && !trimmedHost.contains(":") {
-            // This looks like an IPv4 address, validate it strictly first
-            if isValidIPv4(trimmedHost) {
-                // Only try to parse if validation passed
-                if let ipv4 = IPv4Address(trimmedHost) {
-                    return .hostPort(host: .ipv4(ipv4), port: 80)
-                } else {
-                    throw TracerouteError.invalidHost("Failed to parse IPv4 address: \(trimmedHost)")
-                }
-            } else {
-                throw TracerouteError.invalidHost("Invalid IPv4 address format: \(trimmedHost)")
-            }
+        if host.allSatisfy({ $0.isNumber || $0 == "." }) {
+            guard isValidIPv4(host) else { throw TracerouteError.invalidHost("Invalid IPv4 address format: \(host)") }
+            return .ipv4
         }
-        
-        // Try to parse as IPv6
-        if let ipv6 = IPv6Address(trimmedHost) {
-            return .hostPort(host: .ipv6(ipv6), port: 80)
+        if host.contains(":") {
+            var address = in6_addr()
+            guard inet_pton(AF_INET6, host, &address) == 1 else { throw TracerouteError.invalidHost("Invalid IPv6 address format: \(host)") }
+            return .ipv6
         }
-        
-        // Validate hostname format for domain names
-        if isValidHostname(trimmedHost) {
-            return .hostPort(host: .name(trimmedHost, nil), port: 80)
-        } else {
-            throw TracerouteError.invalidHost("Invalid hostname format: \(trimmedHost)")
-        }
+        guard isValidHostname(host) else { throw TracerouteError.invalidHost("Invalid hostname format: \(host)") }
+        return .name
     }
-    
+
+    /// Resolves the host to a socket address; IPv4 is preferred when a name has both address families
+    func resolveHost(_ host: String) async throws -> ResolvedHost {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let kind = try classifyHost(trimmedHost)
+        return try await Task.detached(priority: .userInitiated) {
+            var hints = addrinfo()
+            hints.ai_family = AF_UNSPEC
+            hints.ai_socktype = SOCK_DGRAM
+            if kind != .name { hints.ai_flags = AI_NUMERICHOST }
+            var list: UnsafeMutablePointer<addrinfo>?
+            let status = getaddrinfo(trimmedHost, nil, &hints, &list)
+            defer { if let list { freeaddrinfo(list) } }
+            guard status == 0, let list else {
+                throw TracerouteError.resolutionFailed(trimmedHost, String(cString: gai_strerror(status)))
+            }
+            var candidates: [ResolvedHost] = []
+            var entry: UnsafeMutablePointer<addrinfo>? = list
+            while let current = entry {
+                let info = current.pointee
+                if info.ai_family == AF_INET || info.ai_family == AF_INET6 {
+                    let address = Data(bytes: info.ai_addr, count: Int(info.ai_addrlen))
+                    candidates.append(ResolvedHost(address: address, family: info.ai_family, ipAddress: Self.numericHost(address) ?? trimmedHost))
+                }
+                entry = info.ai_next
+            }
+            guard let best = candidates.first(where: { $0.family == AF_INET }) ?? candidates.first else {
+                throw TracerouteError.resolutionFailed(trimmedHost, "no IPv4 or IPv6 address")
+            }
+            return best
+        }.value
+    }
+
     /// Validates IPv4 address format strictly
     func isValidIPv4(_ ipString: String) -> Bool {
-        let components = ipString.split(separator: ".")
+        let components = ipString.split(separator: ".", omittingEmptySubsequences: false)
         guard components.count == 4 else { return false }
-        
+
         for component in components {
             guard let num = Int(component), num >= 0 && num <= 255 else {
                 return false
@@ -199,208 +138,14 @@ final class TracerouteManager {
         }
         return true
     }
-    
+
     /// Validates if a string is a valid hostname
     func isValidHostname(_ hostname: String) -> Bool {
-        // Basic hostname validation
         let hostnameRegex = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?)*$"
         let predicate = NSPredicate(format: "SELF MATCHES %@", hostnameRegex)
         return predicate.evaluate(with: hostname) && hostname.count <= 253
     }
-    
-    /// Discovers network hops using progressive timeout simulation
-    private func discoverNetworkHop(
-        targetHost: String,
-        targetIP: String?,
-        hopNumber: Int,
-        timeout: TimeInterval,
-        maxHops: Int
-    ) async throws -> (success: Bool, ipAddress: String?, hostname: String?, message: String, isDestination: Bool) {
-        
-        // Calculate progressive timeout based on hop number to simulate TTL behavior
-        // Early hops get very short timeouts, later hops get longer timeouts
-        let hopTimeout = min(timeout, 0.2 + (Double(hopNumber) * 0.4))
-        
-        // Only attempt connection for later hops (simulating TTL reaching destination)
-        let shouldAttemptConnection = hopNumber >= (maxHops - 5) // Only last 5 hops try connection
-        
-        if shouldAttemptConnection {
-            do {
-                let connectionResult = try await attemptDirectConnection(
-                    to: targetHost,
-                    targetIP: targetIP,
-                    timeout: hopTimeout
-                )
-                
-                if connectionResult.success {
-                    return (
-                        success: true,
-                        ipAddress: connectionResult.ipAddress,
-                        hostname: connectionResult.hostname,
-                        message: formatHopMessage(
-                            ipAddress: connectionResult.ipAddress,
-                            hostname: connectionResult.hostname,
-                            isDestination: true
-                        ),
-                        isDestination: true
-                    )
-                }
-            } catch {
-                // Connection failed, fall through to timeout
-            }
-        }
-        
-        // For early hops or failed connections, simulate intermediate hop timeouts
-        // In real traceroute, these would be ICMP TTL exceeded responses from routers
-        throw TracerouteError.timeout
-    }
-    
-    /// Attempts a direct connection to discover if the host is reachable
-    private func attemptDirectConnection(
-        to host: String,
-        targetIP: String?,
-        timeout: TimeInterval
-    ) async throws -> (success: Bool, ipAddress: String?, hostname: String?) {
-        
-        return try await withTaskCancellationHandler {
-            return try await withCheckedThrowingContinuation { continuation in
-                let queue = DispatchQueue(label: "traceroute.connection")
-                
-                // Try multiple protocols/ports for better reachability detection
-                let endpoints = buildEndpointsForHost(host)
-                
-                attemptConnectionToEndpoints(endpoints, timeout: timeout, queue: queue) { success, ip, hostname in
-                    continuation.resume(returning: (success: success, ipAddress: ip, hostname: hostname))
-                }
-            }
-        } onCancel: {
-            // This handler will be called when the task is cancelled
-        }
-    }
-    
-    /// Builds multiple endpoints to try for a host
-    private func buildEndpointsForHost(_ host: String) -> [NWEndpoint] {
-        var endpoints: [NWEndpoint] = []
-        
-        // Try parsing as IP first
-        if let ipv4 = IPv4Address(host) {
-            endpoints.append(.hostPort(host: .ipv4(ipv4), port: 80))   // HTTP
-            endpoints.append(.hostPort(host: .ipv4(ipv4), port: 443))  // HTTPS
-            endpoints.append(.hostPort(host: .ipv4(ipv4), port: 53))   // DNS
-        } else if let ipv6 = IPv6Address(host) {
-            endpoints.append(.hostPort(host: .ipv6(ipv6), port: 80))
-            endpoints.append(.hostPort(host: .ipv6(ipv6), port: 443))
-            endpoints.append(.hostPort(host: .ipv6(ipv6), port: 53))
-        } else {
-            // For hostnames, try common ports
-            endpoints.append(.hostPort(host: .name(host, nil), port: 80))   // HTTP
-            endpoints.append(.hostPort(host: .name(host, nil), port: 443))  // HTTPS
-            endpoints.append(.hostPort(host: .name(host, nil), port: 53))   // DNS
-        }
-        
-        return endpoints
-    }
-    
-    /// Attempts connections to multiple endpoints
-    private func attemptConnectionToEndpoints(
-        _ endpoints: [NWEndpoint],
-        timeout: TimeInterval,
-        queue: DispatchQueue,
-        completion: @escaping (Bool, String?, String?) -> Void
-    ) {
-        var connections: [NWConnection] = []
-        var hasCompleted = false
-        let lock = NSLock()
-        
-        let completeOnce = { (success: Bool, ip: String?, hostname: String?) in
-            lock.lock()
-            defer { lock.unlock() }
-            
-            guard !hasCompleted else { return }
-            hasCompleted = true
-            
-            // Cancel all connections
-            for connection in connections {
-                connection.cancel()
-            }
-            
-            completion(success, ip, hostname)
-        }
-        
-        // Set up timeout
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-            completeOnce(false, nil, nil)
-        }
-        
-        // Try each endpoint
-        for endpoint in endpoints {
-            let parameters = NWParameters.tcp
-            parameters.prohibitExpensivePaths = false
-            parameters.prohibitConstrainedPaths = false
-            
-            let connection = NWConnection(to: endpoint, using: parameters)
-            connections.append(connection)
-            
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    let ipAddress = self.extractIPAddress(from: endpoint)
-                    let hostname = self.extractHostname(from: endpoint)
-                    completeOnce(true, ipAddress, hostname)
-                    
-                case .failed(_):
-                    // Try to extract IP even from failed connections (DNS resolution might have worked)
-                    if let ipAddress = self.extractIPAddress(from: endpoint) {
-                        let hostname = self.extractHostname(from: endpoint)
-                        completeOnce(true, ipAddress, hostname)
-                    }
-                    // Otherwise, continue trying other endpoints
-                    
-                case .cancelled:
-                    // Connection was cancelled, ignore
-                    break
-                    
-                default:
-                    break
-                }
-            }
-            
-            connection.start(queue: queue)
-        }
-    }
-    
-    /// Extracts IP address from an endpoint
-    private func extractIPAddress(from endpoint: NWEndpoint) -> String? {
-        guard case let .hostPort(host, _) = endpoint else { return nil }
-        
-        switch host {
-        case .ipv4(let ipv4):
-            return ipv4.debugDescription
-        case .ipv6(let ipv6):
-            return ipv6.debugDescription
-        case .name(let name, _):
-            // If it's a name, try to parse as IP
-            if IPv4Address(name) != nil || IPv6Address(name) != nil {
-                return name
-            }
-            return nil
-        @unknown default:
-            return nil
-        }
-    }
-    
-    /// Extracts hostname from an endpoint
-    private func extractHostname(from endpoint: NWEndpoint) -> String? {
-        guard case let .hostPort(host, _) = endpoint else { return nil }
-        
-        switch host {
-        case .name(let name, _):
-            return name
-        default:
-            return nil
-        }
-    }
-    
+
     /// Formats the hop message for display
     func formatHopMessage(
         ipAddress: String?,
@@ -408,43 +153,223 @@ final class TracerouteManager {
         isDestination: Bool
     ) -> String {
         var components: [String] = []
-        
+
         if let hostname = hostname, hostname != ipAddress {
             components.append(hostname)
         }
-        
+
         if let ipAddress = ipAddress {
             components.append("(\(ipAddress))")
         }
-        
+
         let hostInfo = components.isEmpty ? "* * *" : components.joined(separator: " ")
-        
+
         if isDestination {
             return "\(hostInfo) [DESTINATION REACHED]"
         } else {
             return hostInfo
         }
     }
+
+    // MARK: - Tracing
+
+    @MainActor
+    private func trace(host: String, maxHops: Int, timeout: TimeInterval, deliver: @escaping (TracerouteResult) -> Void) async {
+        let target: ResolvedHost
+        do {
+            target = try await resolveHost(host)
+            try openSocket(family: target.family)
+        } catch {
+            deliver(TracerouteResult(hopNumber: 1, success: false, responseTime: 0,
+                                     message: "Failed to resolve host: \(host) - \(error.localizedDescription)"))
+            return
+        }
+
+        for hop in 1...max(1, maxHops) {
+            if Task.isCancelled { return }
+            let sequenceNumbers = sendProbes(to: target, hopLimit: hop)
+            await waitForReplies(to: sequenceNumbers, timeout: timeout)
+            if Task.isCancelled { return }
+
+            let answered = sequenceNumbers.compactMap { replies[$0] }
+            let routerAddress = answered.first?.address
+            let reachedTarget = answered.contains { reply in
+                if case .echoReply = reply.reply { return true }
+                if case .destinationUnreachable = reply.reply { return reply.address == target.ipAddress }
+                return false
+            }
+            let unreachable = answered.contains { if case .destinationUnreachable = $0.reply { return true } else { return false } }
+            let probeTimes: [Double?] = sequenceNumbers.map { replies[$0]?.time }
+            let times = probeTimes.compactMap { $0 }
+            let result = TracerouteResult(
+                hopNumber: hop,
+                success: !answered.isEmpty,
+                ipAddress: routerAddress,
+                responseTime: times.isEmpty ? 0 : times.reduce(0, +) / Double(times.count),
+                message: formatHopMessage(ipAddress: routerAddress, hostname: nil, isDestination: reachedTarget),
+                isDestination: reachedTarget,
+                probeTimes: probeTimes
+            )
+            deliver(result)
+            if let routerAddress {
+                resolveName(of: result, address: routerAddress, deliver: deliver)
+            }
+            // The path ends at the target, or where a router reports the target unreachable
+            if reachedTarget || unreachable { return }
+        }
+    }
+
+    /// Sends the probes of one hop and returns their sequence numbers
+    @MainActor
+    private func sendProbes(to target: ResolvedHost, hopLimit: Int) -> [UInt16] {
+        var limit = Int32(hopLimit)
+        if family == AF_INET6 {
+            setsockopt(socketFD, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &limit, socklen_t(MemoryLayout<Int32>.size))
+        } else {
+            setsockopt(socketFD, IPPROTO_IP, IP_TTL, &limit, socklen_t(MemoryLayout<Int32>.size))
+        }
+        var sent: [UInt16] = []
+        for _ in 0..<Self.probesPerHop {
+            let sequenceNumber = nextSequenceNumber
+            nextSequenceNumber &+= 1
+            let packet = ICMPPacket.echoRequest(family: family, identifier: identifier, sequenceNumber: sequenceNumber, payload: Data(repeating: 0x4E, count: 24))
+            sendTimes[sequenceNumber] = Date()
+            _ = packet.withUnsafeBytes { bytes in
+                target.address.withUnsafeBytes { address in
+                    sendto(socketFD, bytes.baseAddress, bytes.count, 0,
+                           address.bindMemory(to: sockaddr.self).baseAddress, socklen_t(target.address.count))
+                }
+            }
+            // A failed send simply stays unanswered and shows as "*"
+            sent.append(sequenceNumber)
+        }
+        return sent
+    }
+
+    @MainActor
+    private func waitForReplies(to sequenceNumbers: [UInt16], timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !Task.isCancelled, Date() < deadline, sequenceNumbers.contains(where: { replies[$0] == nil }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    /// Looks up the router's name in the background and re-delivers the row with it (ignored if it arrives too late)
+    @MainActor
+    private func resolveName(of result: TracerouteResult, address: String, deliver: @escaping (TracerouteResult) -> Void) {
+        Task { @MainActor in
+            let lookup = Task.detached(priority: .utility) { Self.reverseLookup(address) }
+            let timeoutTask = Task { try? await Task.sleep(nanoseconds: 2_000_000_000); lookup.cancel() }
+            let name = await lookup.value
+            timeoutTask.cancel()
+            guard let name, !lookup.isCancelled, name != address else { return }
+            deliver(TracerouteResult(
+                id: result.id,
+                hopNumber: result.hopNumber,
+                success: result.success,
+                ipAddress: result.ipAddress,
+                hostname: name,
+                responseTime: result.responseTime,
+                message: formatHopMessage(ipAddress: address, hostname: name, isDestination: result.isDestination),
+                isDestination: result.isDestination,
+                probeTimes: result.probeTimes
+            ))
+        }
+    }
+
+    // MARK: - Socket
+
+    @MainActor
+    private func openSocket(family: Int32) throws {
+        closeSocket()
+        self.family = family
+        identifier = UInt16.random(in: 1...UInt16.max)
+        sendTimes.removeAll()
+        replies.removeAll()
+
+        let fd = Darwin.socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        socketFD = fd
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.readReplies(fd: fd) }
+        }
+        source.setCancelHandler { close(fd) }
+        readSource = source
+        source.resume()
+    }
+
+    @MainActor
+    private func closeSocket() {
+        if let readSource {
+            // The cancel handler closes the descriptor, so the reader never sees a reused fd.
+            readSource.cancel()
+            self.readSource = nil
+        } else if socketFD >= 0 {
+            close(socketFD)
+        }
+        socketFD = -1
+    }
+
+    @MainActor
+    private func readReplies(fd: Int32) {
+        var buffer = [UInt8](repeating: 0, count: 2048)
+        var from = sockaddr_storage()
+        while true {
+            var fromLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let count = withUnsafeMutablePointer(to: &from) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buffer, buffer.count, 0, $0, &fromLength) }
+            }
+            guard count > 0 else { return }   // EAGAIN or error: wait for the next read event
+            let received = Date()
+            // Every ICMP socket sees all ICMP traffic of the host, so only replies to our identifier count
+            guard let reply = ICMPPacket.probeReply(in: Data(buffer[0..<count]), family: family, identifier: identifier),
+                  let sent = sendTimes[reply.sequenceNumber],
+                  replies[reply.sequenceNumber] == nil else { continue }
+            let address = withUnsafeBytes(of: &from) { Self.numericHost(Data($0.prefix(Int(fromLength)))) } ?? "?"
+            replies[reply.sequenceNumber] = (received.timeIntervalSince(sent) * 1000, address, reply)
+        }
+    }
+
+    // MARK: - Address Helpers
+
+    /// Numeric host string of a socket address
+    static func numericHost(_ address: Data) -> String? {
+        address.withUnsafeBytes { raw -> String? in
+            guard let sa = raw.bindMemory(to: sockaddr.self).baseAddress else { return nil }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(address.count), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+            return String(cString: host)
+        }
+    }
+
+    /// Reverse DNS name of a numeric address, or nil
+    static func reverseLookup(_ ipAddress: String) -> String? {
+        var hints = addrinfo()
+        hints.ai_flags = AI_NUMERICHOST
+        var list: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(ipAddress, nil, &hints, &list) == 0, let list else { return nil }
+        defer { freeaddrinfo(list) }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(list.pointee.ai_addr, list.pointee.ai_addrlen, &host, socklen_t(host.count), nil, 0, NI_NAMEREQD) == 0 else { return nil }
+        return String(cString: host)
+    }
 }
 
 // MARK: - Supporting Types
 
-enum TracerouteError: Error {
-    case connectionFailed
-    case timeout
-    case cancelled
+enum TracerouteError: LocalizedError {
     case invalidHost(String)
-    
-    var localizedDescription: String {
+    case resolutionFailed(String, String)
+
+    var errorDescription: String? {
         switch self {
-        case .connectionFailed:
-            return "Connection failed"
-        case .timeout:
-            return "Request timed out"
-        case .cancelled:
-            return "Operation cancelled"
         case .invalidHost(let message):
             return message
+        case .resolutionFailed(let host, let reason):
+            return "Cannot resolve \(host): \(reason)"
         }
     }
-} 
+}

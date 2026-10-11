@@ -106,6 +106,17 @@ final class netoUITests: XCTestCase {
         XCTAssertTrue(lookup.isEnabled)
     }
 
+    @MainActor
+    func testTracerouteToLoopbackReachesDestination() throws {
+        openTool("traceroute", expecting: "traceroute.header")
+        let host = element("traceroute.host")
+        host.tap()
+        // Return starts the trace; tapping Start can hit the on-screen keyboard on iPhone in landscape
+        host.typeText("127.0.0.1\n")
+        XCTAssertTrue(element("traceroute.destination").waitForExistence(timeout: 10), "Loopback must be reached at the first hop")
+        XCTAssertTrue(waitForDisappearance(of: element("traceroute.stop"), timeout: 5), "Stop must disappear after the run")
+    }
+
     // MARK: - ARP
 
     @MainActor

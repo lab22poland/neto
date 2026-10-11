@@ -7,8 +7,8 @@
 //
 
 import Foundation
-import Network
 import Testing
+import XCTest
 @testable import neto
 
 /// Host validation, resolution and hop formatting in TracerouteManager
@@ -30,35 +30,32 @@ struct TracerouteManagerLogicTests {
         #expect(TracerouteManager().isValidHostname(hostname) == valid)
     }
 
-    @Test func resolvesAddressesAndNames() async throws {
-        let manager = TracerouteManager()
-        let ipv4 = try await manager.resolveHost(" 127.0.0.1 ")
-        let ipv6 = try await manager.resolveHost("::1")
-        let name = try await manager.resolveHost("localhost")
-        #expect(ipv4 == .hostPort(host: .ipv4(.loopback), port: 80))
-        #expect(ipv6 == .hostPort(host: .ipv6(.loopback), port: 80))
-        #expect(name == .hostPort(host: .name("localhost", nil), port: 80))
+    @Test(arguments: [("8.8.8.8", TracerouteManager.HostKind.ipv4), ("::1", .ipv6), ("2001:db8::1", .ipv6),
+                      ("example.com", .name), ("sub.example.co.uk", .name), ("localhost", .name)])
+    func hostKind(host: String, kind: TracerouteManager.HostKind) throws {
+        #expect(try TracerouteManager().classifyHost(host) == kind)
     }
 
-    @Test func resolvesDomainNames() async {
-        await withKnownIssue("Any host with a dot and no colon is validated as IPv4, so every domain name is rejected") {
-            let endpoint = try await TracerouteManager().resolveHost("example.com")
-            #expect(endpoint == .hostPort(host: .name("example.com", nil), port: 80))
-        }
-    }
-
-    @Test(arguments: ["", "999.1.1.1", "bad host"])
+    @Test(arguments: ["", "999.1.1.1", "1.2.3", "bad host", "2001:db8::zz"])
     func rejectsInvalidHosts(_ host: String) async {
         await #expect(throws: TracerouteError.self) {
             try await TracerouteManager().resolveHost(host)
         }
     }
 
+    @Test func resolvesLocalAddresses() async throws {
+        let manager = TracerouteManager()
+        let ipv4 = try await manager.resolveHost(" 127.0.0.1 ")
+        let ipv6 = try await manager.resolveHost("::1")
+        let name = try await manager.resolveHost("localhost")
+        #expect(ipv4.family == AF_INET && ipv4.ipAddress == "127.0.0.1")
+        #expect(ipv6.family == AF_INET6 && ipv6.ipAddress == "::1")
+        #expect(name.family == AF_INET && name.ipAddress == "127.0.0.1", "IPv4 is preferred for names")
+    }
+
     @Test func errorMessageReachesUser() {
         let error: Error = TracerouteError.invalidHost("Invalid IPv4 address format: 999.1.1.1")
-        withKnownIssue("TracerouteError is not a LocalizedError, so users see Foundation's generic text") {
-            #expect(error.localizedDescription == "Invalid IPv4 address format: 999.1.1.1")
-        }
+        #expect(error.localizedDescription == "Invalid IPv4 address format: 999.1.1.1")
     }
 
     @Test func hopMessageFormatting() {
@@ -67,9 +64,67 @@ struct TracerouteManagerLogicTests {
         #expect(manager.formatHopMessage(ipAddress: "1.1.1.1", hostname: "1.1.1.1", isDestination: true) == "(1.1.1.1) [DESTINATION REACHED]")
         #expect(manager.formatHopMessage(ipAddress: nil, hostname: nil, isDestination: false) == "* * *")
     }
+
+    @Test func probeTimesFormatting() {
+        let result = TracerouteResult(hopNumber: 1, success: true, responseTime: 2, message: "", probeTimes: [1.234, nil, 3])
+        #expect(result.formattedProbeTimes == "1.23 ms  *  3.00 ms")
+    }
 }
 
-/// Parameter validation before any network call
+/// A real traceroute over loopback: the target answers at hop 1 (no internet needed)
+@MainActor
+final class TracerouteLoopbackTests: XCTestCase {
+
+    private func run(_ host: String, maxHops: Int = 5, cancelAfterStart: Bool = false) -> (results: [TracerouteResult], completions: Int) {
+        let manager = TracerouteManager()
+        var results: [TracerouteResult] = []
+        var completions = 0
+        let completed = expectation(description: "completed")
+        let task = manager.performTraceroute(to: host, maxHops: maxHops, timeout: 2,
+                                             onResult: { result in
+                                                 // A second call with the same id carries the router's name
+                                                 if let index = results.firstIndex(where: { $0.id == result.id }) {
+                                                     results[index] = result
+                                                 } else {
+                                                     results.append(result)
+                                                 }
+                                             },
+                                             onComplete: { completions += 1; completed.fulfill() })
+        if cancelAfterStart { task.cancel() }
+        wait(for: [completed], timeout: 10)
+        let settle = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { settle.fulfill() }
+        wait(for: [settle], timeout: 2)
+        return (results, completions)
+    }
+
+    func testLoopbackIsReachedAtFirstHop() {
+        let (results, completions) = run("127.0.0.1")
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(results.count, 1, results.map(\.message).joined(separator: "; "))
+        XCTAssertEqual(results.first?.hopNumber, 1)
+        XCTAssertEqual(results.first?.isDestination, true)
+        XCTAssertEqual(results.first?.ipAddress, "127.0.0.1")
+        XCTAssertEqual(results.first?.probeTimes.count, TracerouteManager.probesPerHop)
+        XCTAssertTrue(results.first?.probeTimes.allSatisfy { $0 != nil } == true)
+    }
+
+    func testInvalidHostReportsErrorAndCompletesOnce() {
+        let (results, completions) = run("999.1.1.1")
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results.first?.success, false)
+        XCTAssertTrue(results.first?.message.contains("Invalid IPv4 address format: 999.1.1.1") == true)
+    }
+
+    func testCancelCompletesOnceWithoutResults() {
+        let (results, completions) = run("127.0.0.1", cancelAfterStart: true)
+        XCTAssertEqual(completions, 1)
+        XCTAssertTrue(results.isEmpty)
+    }
+}
+
+/// Parameter validation, progress and late-update handling in the view model
 @MainActor
 struct TracerouteViewModelTests {
 
@@ -79,7 +134,7 @@ struct TracerouteViewModelTests {
         #expect(!viewModel.canStartTraceroute)
     }
 
-    @Test(arguments: [(0, 5.0), (51, 5.0), (30, 0.0), (30, 31.0)])
+    @Test(arguments: [(0, 5.0), (51, 5.0), (30, 0.5), (30, 31.0)])
     func outOfRangeParametersAreRejected(maxHops: Int, timeout: Double) {
         let viewModel = TracerouteViewModel()
         viewModel.targetHost = "127.0.0.1"
@@ -89,5 +144,28 @@ struct TracerouteViewModelTests {
         viewModel.startTraceroute()
         #expect(!viewModel.isTracing)
         #expect(viewModel.errorMessage != nil)
+    }
+
+    @Test func progressAndStopRow() {
+        let viewModel = TracerouteViewModel()
+        viewModel.maxHops = 10
+        viewModel.tracerouteResults = [
+            TracerouteResult(hopNumber: 1, success: true, responseTime: 1, message: "(10.0.0.1)"),
+            TracerouteResult(hopNumber: 2, success: false, responseTime: 0, message: "* * *"),
+        ]
+        #expect(viewModel.currentHop == 2)
+        #expect(viewModel.progress == 0.2)
+
+        viewModel.isTracing = true
+        viewModel.stopTraceroute()
+        #expect(viewModel.tracerouteResults.last?.message == "Traceroute stopped by user")
+        #expect(viewModel.currentHop == 2, "the stop row is not a hop")
+    }
+
+    @Test func destinationCompletesProgress() {
+        let viewModel = TracerouteViewModel()
+        viewModel.maxHops = 30
+        viewModel.tracerouteResults = [TracerouteResult(hopNumber: 3, success: true, responseTime: 1, message: "", isDestination: true)]
+        #expect(viewModel.progress == 1.0)
     }
 }

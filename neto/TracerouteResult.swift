@@ -34,6 +34,9 @@ struct TracerouteResult: Identifiable {
     /// Whether this hop is the final destination
     let isDestination: Bool
     
+    /// Round-trip time of each probe sent to this hop in milliseconds, nil for a probe without reply
+    let probeTimes: [Double?]
+    
     init(
         id: UUID = UUID(),
         hopNumber: Int,
@@ -42,7 +45,8 @@ struct TracerouteResult: Identifiable {
         hostname: String? = nil,
         responseTime: Double,
         message: String,
-        isDestination: Bool = false
+        isDestination: Bool = false,
+        probeTimes: [Double?] = []
     ) {
         self.id = id
         self.hopNumber = hopNumber
@@ -52,5 +56,11 @@ struct TracerouteResult: Identifiable {
         self.responseTime = responseTime
         self.message = message
         self.isDestination = isDestination
+        self.probeTimes = probeTimes
+    }
+    
+    /// Probe times as shown by traceroute, e.g. "1.23 ms  4.56 ms  *"
+    var formattedProbeTimes: String {
+        probeTimes.map { $0.map { String(format: "%.2f ms", $0) } ?? "*" }.joined(separator: "  ")
     }
 } 

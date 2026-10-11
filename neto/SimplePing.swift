@@ -289,6 +289,60 @@ enum ICMPPacket {
         return UInt16(icmp[6]) << 8 | UInt16(icmp[7])
     }
     
+    /// What came back for a traceroute probe (an echo request sent with a limited TTL / hop limit)
+    enum ProbeReply: Equatable {
+        /// A router on the path dropped the probe (ICMP Time Exceeded)
+        case timeExceeded(sequenceNumber: UInt16)
+        /// The probe could not be delivered (ICMP Destination Unreachable); `code` as in the ICMP header
+        case destinationUnreachable(sequenceNumber: UInt16, code: UInt8)
+        /// The target answered (ICMP Echo Reply)
+        case echoReply(sequenceNumber: UInt16)
+        
+        var sequenceNumber: UInt16 {
+            switch self {
+            case .timeExceeded(let sequenceNumber), .destinationUnreachable(let sequenceNumber, _), .echoReply(let sequenceNumber):
+                return sequenceNumber
+            }
+        }
+    }
+    
+    /// Classifies a received packet as a reply to one of our probes (matched by identifier), or nil.
+    /// Error messages quote our original datagram: its IP header plus at least 8 bytes of our ICMP header (RFC 792),
+    /// which carry the identifier and sequence number. IPv6 support follows RFC 4443 and is not verified on a live network.
+    static func probeReply(in packet: Data, family: Int32, identifier: UInt16) -> ProbeReply? {
+        if let sequenceNumber = echoReplySequenceNumber(in: packet, family: family, identifier: identifier) {
+            return .echoReply(sequenceNumber: sequenceNumber)
+        }
+        guard let offset = icmpHeaderOffset(in: packet, family: family),
+              packet.count >= offset + headerSize else { return nil }
+        let bytes = [UInt8](packet)
+        let type = bytes[offset], code = bytes[offset + 1]
+        let quoted = offset + headerSize
+        
+        let quotedICMP: Int
+        let isTimeExceeded: Bool
+        if family == AF_INET6 {
+            guard type == 3 || type == 1 else { return nil }   // ICMPv6 Time Exceeded / Destination Unreachable
+            isTimeExceeded = type == 3
+            // Fixed 40-byte IPv6 header with Next Header = ICMPv6
+            guard bytes.count >= quoted + 40, bytes[quoted] >> 4 == 6, bytes[quoted + 6] == UInt8(IPPROTO_ICMPV6) else { return nil }
+            quotedICMP = quoted + 40
+        } else {
+            guard type == 11 || type == 3 else { return nil }  // ICMP Time Exceeded / Destination Unreachable
+            isTimeExceeded = type == 11
+            guard bytes.count >= quoted + 20, bytes[quoted] >> 4 == 4, bytes[quoted + 9] == UInt8(IPPROTO_ICMP) else { return nil }
+            let quotedHeaderLength = Int(bytes[quoted] & 0x0F) * 4
+            guard quotedHeaderLength >= 20 else { return nil }
+            quotedICMP = quoted + quotedHeaderLength
+        }
+        guard bytes.count >= quotedICMP + headerSize,
+              bytes[quotedICMP] == (family == AF_INET6 ? echoRequestV6 : echoRequestV4),
+              UInt16(bytes[quotedICMP + 4]) << 8 | UInt16(bytes[quotedICMP + 5]) == identifier else { return nil }
+        let sequenceNumber = UInt16(bytes[quotedICMP + 6]) << 8 | UInt16(bytes[quotedICMP + 7])
+        return isTimeExceeded ? .timeExceeded(sequenceNumber: sequenceNumber)
+                              : .destinationUnreachable(sequenceNumber: sequenceNumber, code: code)
+    }
+    
     /// Internet checksum (RFC 1071); returns the value in host order, to be written big-endian
     static func checksum(_ data: Data) -> UInt16 {
         var sum: UInt32 = 0

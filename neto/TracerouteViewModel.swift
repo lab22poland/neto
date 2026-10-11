@@ -26,6 +26,10 @@ final class TracerouteViewModel: ObservableObject {
     
     private let tracerouteManager = TracerouteManager()
     private var tracerouteTask: Task<Void, Never>?
+    /// Identifies the current run, so late callbacks of a stopped run cannot touch a newer one
+    private var currentRunID: UUID?
+    /// The "stopped by user" row is not a hop and does not count for progress
+    private var stopRowID: UUID?
     
     // MARK: - Public Methods
     
@@ -49,7 +53,7 @@ final class TracerouteViewModel: ObservableObject {
         }
         
         // Validate timeout
-        guard timeout > 0 && timeout <= 30 else {
+        guard timeout >= 1 && timeout <= 30 else {
             errorMessage = "Timeout must be between 1 and 30 seconds"
             return
         }
@@ -58,6 +62,9 @@ final class TracerouteViewModel: ObservableObject {
         isTracing = true
         errorMessage = nil
         tracerouteResults.removeAll()
+        stopRowID = nil
+        let runID = UUID()
+        currentRunID = runID
         
         // Start traceroute operation
         tracerouteTask = tracerouteManager.performTraceroute(
@@ -65,9 +72,11 @@ final class TracerouteViewModel: ObservableObject {
             maxHops: maxHops,
             timeout: timeout,
             onResult: { [weak self] result in
+                guard self?.currentRunID == runID else { return }
                 self?.handleTracerouteResult(result)
             },
             onComplete: { [weak self] in
+                guard self?.currentRunID == runID else { return }
                 self?.handleTracerouteComplete()
             }
         )
@@ -77,18 +86,19 @@ final class TracerouteViewModel: ObservableObject {
     func stopTraceroute() {
         tracerouteTask?.cancel()
         tracerouteTask = nil
+        currentRunID = nil
         isTracing = false
         
         // Add a final result to show the traceroute was stopped
         if !tracerouteResults.isEmpty {
-            let lastHop = tracerouteResults.count + 1
             let result = TracerouteResult(
-                hopNumber: lastHop,
+                hopNumber: currentHop + 1,
                 success: false,
                 responseTime: 0,
                 message: "Traceroute stopped by user",
                 isDestination: false
             )
+            stopRowID = result.id
             tracerouteResults.append(result)
         }
     }
@@ -102,19 +112,20 @@ final class TracerouteViewModel: ObservableObject {
     var canStartTraceroute: Bool {
         isTargetHostValid && 
         maxHops > 0 && maxHops <= 50 &&
-        timeout > 0 && timeout <= 30 &&
+        timeout >= 1 && timeout <= 30 &&
         !isTracing
     }
     
     /// Gets the current progress as a percentage (0.0 to 1.0)
     var progress: Double {
         guard maxHops > 0 else { return 0.0 }
-        return min(Double(tracerouteResults.count) / Double(maxHops), 1.0)
+        if destinationReached { return 1.0 }
+        return min(Double(currentHop) / Double(maxHops), 1.0)
     }
     
     /// Gets the current hop count
     var currentHop: Int {
-        tracerouteResults.count
+        tracerouteResults.filter { $0.id != stopRowID }.map(\.hopNumber).max() ?? 0
     }
     
     /// Checks if the destination has been reached
@@ -126,11 +137,12 @@ final class TracerouteViewModel: ObservableObject {
     
     /// Handles individual traceroute results
     private func handleTracerouteResult(_ result: TracerouteResult) {
-        tracerouteResults.append(result)
-        
-        // If we reached the destination, we can stop early
-        if result.isDestination {
-            // Don't stop immediately, let the manager complete naturally
+        if let index = tracerouteResults.firstIndex(where: { $0.id == result.id }) {
+            // Same hop again, now with the router's name
+            tracerouteResults[index] = result
+        } else if result.hostname == nil {
+            // A name update for a row that is gone (cleared) is dropped
+            tracerouteResults.append(result)
         }
     }
     
@@ -144,6 +156,7 @@ final class TracerouteViewModel: ObservableObject {
     func clearResults() {
         guard !isTracing else { return }
         
+        currentRunID = nil
         tracerouteResults.removeAll()
         errorMessage = nil
     }
@@ -164,11 +177,11 @@ final class TracerouteViewModel: ObservableObject {
             output += "No results available.\n"
         } else {
             for result in tracerouteResults {
-                if result.success {
-                    output += String(format: "%2d. %@  %.2fms\n", 
-                                   result.hopNumber, 
-                                   result.message, 
-                                   result.responseTime)
+                if !result.probeTimes.isEmpty {
+                    output += String(format: "%2d. %@  %@\n",
+                                   result.hopNumber,
+                                   result.message,
+                                   result.formattedProbeTimes)
                 } else {
                     output += String(format: "%2d. %@\n", 
                                    result.hopNumber, 
