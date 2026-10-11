@@ -150,19 +150,6 @@ neto/                         # Xcode project directory (current location)
 - **SwiftUI Navigation**: Platform-adaptive interface design
 - **Entitlements**: Secure network access permissions
 
-## 🤖 AI-Powered Development
-
-This application was created using **AI-assisted development** with:
-- **[Cursor](https://cursor.sh/)**: AI-powered code editor
-- **[Claude Sonnet 4](https://www.anthropic.com/claude)**: Advanced AI coding assistant
-
-The AI tools helped with:
-- 🏗️ **Architecture Design**: SwiftUI MVVM patterns and multiplatform considerations
-- 🔧 **Code Generation**: Swift implementation with modern async/await patterns  
-- 🐛 **Bug Fixing**: Network permission issues and App Sandbox configuration
-- 📚 **Documentation**: Comprehensive code comments and this README
-- ✅ **Testing**: Cross-platform build verification and functionality testing
-
 ## 📄 License
 
 This project is licensed under the **BSD 3-Clause License**.
