@@ -19,15 +19,19 @@ xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arc
 xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoUITests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=   # ~1–1.5 min
 
 # Single test: XCTest method vs. Swift Testing function (note the parentheses)
-xcodebuild ... test -only-testing:netoTests/SimplePingTests/testSimplePingInitialization
-xcodebuild ... test -only-testing:'netoTests/netoTests/networkToolCaseCount()'
+xcodebuild ... test -only-testing:netoTests/PingManagerTests/testZeroCountCompletesWithoutResults
+xcodebuild ... test -only-testing:'netoTests/WhoisManagerLogicTests/emptyQueryHasNoServer()'
 ```
 
 On simulators always pass `-parallel-testing-enabled NO`: with parallel testing, xcodebuild spawns simulator clones whose app launch fails (`RequestDenied` / `Launch failed`), adding log noise and up to 10 minutes of diagnostics timeout, even though the tests themselves run on one clone. Before a simulator test run, uninstall stale builds (`xcrun simctl uninstall <udid> pl.lab22.neto` and `pl.lab22.netoUITests.xctrunner`); otherwise launches regularly fail with `Busy ("Application failed preflight checks")`.
 
 Simulator names depend on the installed runtime – check `xcrun simctl list devices available`. Per project convention, verify changes on macOS, an iPhone simulator and an iPad Pro 11-inch simulator.
 
-The unit test suite is not green yet (WHOIS and stale assertions fail), and many tests hit the real network (ICMP to 127.0.0.1 / 8.8.8.8, live WHOIS servers). Known failures are listed in `../.claude/test-baseline.md` (workspace root); compare against it instead of assuming that every failure is new.
+Unit tests (`netoTests/`, one file per area) test app logic, not Swift: pure functions are `internal` (not `private`) so `@testable import` can reach them – e.g. `ICMPPacket` (packet encoding), `WhoisManager.chooseServer/formatQueryForServer/parseWhoisReferral/parseWhoisResponse`, `TracerouteManager.resolveHost/isValidIPv4/formatHopMessage`. Ping tests use real ICMP over loopback (127.0.0.1, ::1), which needs no internet. Do not add tests that only build a struct and read its fields back or copy app code (e.g. a regex) into the test.
+
+- Known app bugs are pinned with `withKnownIssue` (Swift Testing) or `XCTExpectFailure` (XCTest): the test passes while the bug exists and fails once it is fixed – then remove the wrapper.
+- Tests that need the internet live in `NetworkDependentTests.swift` (tag `network`) and are skipped by default. Run them with `TEST_RUNNER_NETO_NETWORK_TESTS=1 xcodebuild … test`; they depend on live registry data.
+- Known failures and the current pass counts are in `../.claude/test-baseline.md` (workspace root).
 
 No linter or formatter is configured. All three targets use Xcode file-system synchronized groups: new files in `neto/`, `netoTests/` or `netoUITests/` are picked up without editing `project.pbxproj`.
 

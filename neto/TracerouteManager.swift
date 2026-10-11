@@ -147,7 +147,7 @@ final class TracerouteManager {
     }
     
     /// Resolves the target host to an endpoint with proper validation
-    private func resolveHost(_ host: String) async throws -> NWEndpoint {
+    func resolveHost(_ host: String) async throws -> NWEndpoint {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         
         // Validate the host is not empty
@@ -184,7 +184,7 @@ final class TracerouteManager {
     }
     
     /// Validates IPv4 address format strictly
-    private func isValidIPv4(_ ipString: String) -> Bool {
+    func isValidIPv4(_ ipString: String) -> Bool {
         let components = ipString.split(separator: ".")
         guard components.count == 4 else { return false }
         
@@ -201,7 +201,7 @@ final class TracerouteManager {
     }
     
     /// Validates if a string is a valid hostname
-    private func isValidHostname(_ hostname: String) -> Bool {
+    func isValidHostname(_ hostname: String) -> Bool {
         // Basic hostname validation
         let hostnameRegex = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?)*$"
         let predicate = NSPredicate(format: "SELF MATCHES %@", hostnameRegex)
@@ -402,7 +402,7 @@ final class TracerouteManager {
     }
     
     /// Formats the hop message for display
-    private func formatHopMessage(
+    func formatHopMessage(
         ipAddress: String?,
         hostname: String?,
         isDestination: Bool
@@ -429,7 +429,7 @@ final class TracerouteManager {
 
 // MARK: - Supporting Types
 
-private enum TracerouteError: Error {
+enum TracerouteError: Error {
     case connectionFailed
     case timeout
     case cancelled

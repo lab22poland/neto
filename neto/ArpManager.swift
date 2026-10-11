@@ -365,7 +365,7 @@ final class ArpManager {
     }
     
     /// Parses a link-layer address to extract MAC address string
-    private func parseLinkLayerAddress(_ sa: UnsafeMutablePointer<sockaddr>) -> String? {
+    func parseLinkLayerAddress(_ sa: UnsafeMutablePointer<sockaddr>) -> String? {
         guard sa.pointee.sa_family == UInt8(AF_LINK) else { return nil }
         
         // Cast to sockaddr_dl to access the structure properly
