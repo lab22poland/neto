@@ -39,6 +39,7 @@ struct AboutView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("About NETo")
                         .font(.headline)
+                        .accessibilityIdentifier("about.header")
                     
                     Text("NETo (Network Engineer Tools) is a multiplatform SwiftUI application designed specifically for network engineers and IT professionals. This powerful suite of tools provides essential utilities for network management, troubleshooting, and diagnostics.")
                         .font(.body)
