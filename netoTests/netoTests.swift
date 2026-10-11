@@ -16,7 +16,7 @@ struct netoTests {
     // MARK: - NetworkTool Tests
     @Test func networkToolCaseCount() async throws {
         // Test that we have the expected number of tools (including WHOIS)
-        #expect(NetworkTool.allCases.count == 4)
+        #expect(NetworkTool.allCases.count == 5)
     }
     
     @Test func networkToolIdentifiers() async throws {
@@ -354,7 +354,7 @@ struct netoTests {
             }
             
             // Test invalid domains with separate instances to ensure isolation
-            let invalidDomains = ["", "   ", "invalid_domain"]
+            let invalidDomains = ["", "   ", "foo.bar!"]
             
             for domain in invalidDomains {
                 let viewModel = WhoisViewModel()
@@ -398,7 +398,7 @@ struct netoTests {
     
     @Test func whoisDomainValidation() {
         // Test domain validation using the same regex pattern as WhoisViewModel
-        let domainRegex = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?\\.[a-zA-Z]{2,}$"
+        let domainRegex = "^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,63}$"
         let domainPredicate = NSPredicate(format: "SELF MATCHES %@", domainRegex)
         
         // Test valid domains
@@ -934,7 +934,7 @@ struct WhoisManagerIntegrationTests {
                 
                 // .org domains should use PIR server (when successful)
                 if domain.hasSuffix(".org") {
-                    #expect(result.whoisServer?.contains("pir.org") == true, "ORG domains should use PIR WHOIS server")
+                    #expect(result.whoisServer == "whois.publicinterestregistry.org", "ORG domains should use PIR WHOIS server")
                 }
                 
                 print("✓ \(domain): Success (Server: \(result.whoisServer ?? "unknown"))")
@@ -1055,11 +1055,11 @@ struct WhoisManagerIntegrationTests {
                 
                 // Verify appropriate WHOIS server was used (when successful)
                 if domain.hasSuffix(".uk") {
-                    #expect(result.whoisServer?.contains("nominet") == true, "UK domains should use Nominet server")
+                    #expect(result.rawResponse.contains("Nominet"), "UK lookup should return Nominet data (IANA has no whois: for .uk)")
                 } else if domain.hasSuffix(".de") {
                     #expect(result.whoisServer?.contains("denic") == true, "DE domains should use DENIC server")
                 } else if domain.hasSuffix(".fr") {
-                    #expect(result.whoisServer?.contains("afnic") == true, "FR domains should use AFNIC server")
+                    #expect(result.whoisServer == "whois.nic.fr", "FR domains should use AFNIC server")
                 }
                 
                 print("✓ \(domain): Success (Server: \(result.whoisServer ?? "unknown"))")
@@ -1099,7 +1099,8 @@ struct WhoisManagerIntegrationTests {
                 let isNoDataResponse = response.contains("no data found") ||
                                      response.contains("no match") ||
                                      response.contains("not found") ||
-                                     response.contains("no matching record")
+                                     response.contains("no matching record") ||
+                                     response.contains("returned 0 objects")
                 #expect(isNoDataResponse, "Successful response for invalid domain should indicate no data found")
             } else {
                 #expect(result.statusMessage.contains("failed"), "Failed response should have appropriate status message")
@@ -1114,12 +1115,18 @@ struct WhoisManagerIntegrationTests {
         let manager = WhoisManager()
         
         // Test malformed inputs that should fail gracefully
-        let malformedInputs = [
-            "",                     // Empty string
-            "not-a-domain",        // No TLD
-            "spaces in domain.com", // Invalid characters
-            "999.999.999.999"      // Invalid IP
-        ]
+        // whois.c choose_server("") -> errx "no default whois server"; only this fails locally
+        let malformedInputs = [""]
+        // These are sent to IANA (as whois.c does) and IANA answers with an error/0 objects
+        for input in ["not-a-domain", "spaces in domain.com", "999.999.999.999"] {
+            let r = await withCheckedContinuation { c in
+                let _ = manager.performWhois(for: input) { c.resume(returning: $0) }
+            }
+            if r.success {
+                #expect(r.whoisServer == "whois.iana.org")
+                #expect(r.rawResponse.contains("Invalid query") || r.rawResponse.contains("returned 0 objects"))
+            }
+        }
         
         for input in malformedInputs {
             print("Testing malformed input: '\(input)'")

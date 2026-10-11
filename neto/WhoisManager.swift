@@ -123,7 +123,10 @@ final class WhoisManager {
     
     /// Performs WHOIS lookup following FreeBSD logic with recursion
     private func performFreeBSDWhoisLookup(query: String, startTime: Date, flags: Int = 1) async throws -> WhoisResult {
-        let chosenServer = chooseServer(for: query)
+        guard let chosenServer = chooseServer(for: query) else {
+            // whois.c choose_server(): errx(EX_SOFTWARE, "no default whois server")
+            throw URLError(.badURL)
+        }
         let whoisData = try await queryWhoisServerFreeBSD(server: chosenServer, query: query)
         
         // Check for referrals if recursion is enabled (FreeBSD default behavior)
@@ -159,14 +162,10 @@ final class WhoisManager {
     }
     
     /// FreeBSD choose_server() function equivalent
-    private func chooseServer(for query: String) -> String {
+    private func chooseServer(for query: String) -> String? {
         let domain = query.lowercased()
         
         for (suffix, server) in whoisWhere {
-            if suffix.isEmpty {
-                return server // default case (IANA)
-            }
-            
             if domain.count > suffix.count {
                 let domainSuffix = String(domain.suffix(suffix.count))
                 if domainSuffix.caseInsensitiveCompare(suffix) == .orderedSame {
@@ -175,7 +174,7 @@ final class WhoisManager {
             }
         }
         
-        return ianaHost // safety fallback
+        return nil // whois.c: errx "no default whois server"
     }
     
     /// RFC 3912 compliant WHOIS query with FreeBSD server-specific formatting
