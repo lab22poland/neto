@@ -162,7 +162,7 @@ final class WhoisManager {
     }
     
     /// FreeBSD choose_server() function equivalent
-    private func chooseServer(for query: String) -> String? {
+    func chooseServer(for query: String) -> String? {
         let domain = query.lowercased()
         
         for (suffix, server) in whoisWhere {
@@ -244,7 +244,7 @@ final class WhoisManager {
     }
     
     /// FreeBSD server-specific query formatting
-    private func formatQueryForServer(query: String, server: String) -> String {
+    func formatQueryForServer(query: String, server: String) -> String {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         
         // DENIC (German) special formatting
@@ -320,7 +320,7 @@ final class WhoisManager {
     }
     
     /// FreeBSD-style referral parsing
-    private func parseWhoisReferral(from response: String) -> (host: String, port: String)? {
+    func parseWhoisReferral(from response: String) -> (host: String, port: String)? {
         let lines = response.components(separatedBy: .newlines)
         
         for line in lines {
@@ -379,7 +379,7 @@ final class WhoisManager {
     }
     
     /// Enhanced WHOIS response parsing (more comprehensive than before)
-    private func parseWhoisResponse(_ response: String, for query: String) -> (
+    func parseWhoisResponse(_ response: String, for query: String) -> (
         registrar: String?,
         registrationDate: String?,
         expirationDate: String?,

@@ -37,31 +37,6 @@ final class SimplePing: NSObject {
         func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data)
     }
     
-    /// ICMP header structure (fields stored in network byte order on the wire)
-    private struct ICMPHeader {
-        var type: UInt8
-        var code: UInt8
-        var checksum: UInt16
-        var identifier: UInt16
-        var sequenceNumber: UInt16
-        
-        init(type: UInt8, code: UInt8, identifier: UInt16, sequenceNumber: UInt16) {
-            self.type = type
-            self.code = code
-            self.checksum = 0
-            self.identifier = identifier.bigEndian
-            self.sequenceNumber = sequenceNumber.bigEndian
-        }
-    }
-    
-    // MARK: - Constants
-    
-    private let ICMP_ECHO_REQUEST: UInt8 = 8
-    private let ICMP_ECHO_REPLY: UInt8 = 0
-    private let ICMP6_ECHO_REQUEST: UInt8 = 128
-    private let ICMP6_ECHO_REPLY: UInt8 = 129
-    private let ICMP_TIMEOUT: UInt8 = 11
-    
     // MARK: - Properties
     
     private let hostName: String
@@ -248,34 +223,10 @@ final class SimplePing: NSObject {
         }
     }
     
-    /// Returns the offset of the ICMP header. IPv4 SOCK_DGRAM ICMP sockets on Darwin
-    /// deliver the IP header too; IPv6 ones do not.
-    private func icmpHeaderOffset(in packet: Data) -> Int? {
-        guard addressFamily == AF_INET else { return 0 }
-        guard packet.count >= 20 else { return nil }
-        let versionAndIHL = packet[packet.startIndex]
-        guard versionAndIHL >> 4 == 4 else { return nil }
-        let ipHeaderLength = Int(versionAndIHL & 0x0F) * 4
-        guard packet[packet.startIndex + 9] == UInt8(IPPROTO_ICMP) else { return nil }
-        return ipHeaderLength
-    }
-    
     /// Processes a received ICMP packet (always called on the main queue)
     private func processReceivedPacket(_ packetData: Data) {
-        guard let offset = icmpHeaderOffset(in: packetData),
-              packetData.count >= offset + MemoryLayout<ICMPHeader>.size else {
-            delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
-            return
-        }
-        let icmp = packetData.subdata(in: (packetData.startIndex + offset)..<packetData.endIndex)
-        let header = icmp.withUnsafeBytes { $0.loadUnaligned(as: ICMPHeader.self) }
-        let replyType = addressFamily == AF_INET6 ? ICMP6_ECHO_REPLY : ICMP_ECHO_REPLY
-        
-        if header.type == replyType,
-           header.code == 0,
-           UInt16(bigEndian: header.identifier) == identifier,
-           addressFamily == AF_INET6 || calculateChecksum(data: icmp) == 0 {
-            delegate?.simplePing(self, didReceivePingResponsePacket: icmp, sequenceNumber: UInt16(bigEndian: header.sequenceNumber))
+        if let sequenceNumber = ICMPPacket.echoReplySequenceNumber(in: packetData, family: addressFamily, identifier: identifier) {
+            delegate?.simplePing(self, didReceivePingResponsePacket: packetData, sequenceNumber: sequenceNumber)
         } else {
             delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
         }
@@ -283,27 +234,63 @@ final class SimplePing: NSObject {
     
     /// Creates an ICMP echo request packet
     private func createICMPPacket(sequenceNumber: UInt16, payload: Data?) -> Data? {
-        var header = ICMPHeader(
-            type: addressFamily == AF_INET6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO_REQUEST,
-            code: 0,
-            identifier: identifier,
-            sequenceNumber: sequenceNumber
-        )
-        var packet = Data(bytes: &header, count: MemoryLayout<ICMPHeader>.size)
-        if let payload = payload {
-            packet.append(payload)
-        }
-        // For ICMPv6 the kernel computes the checksum (it covers a pseudo-header).
-        if addressFamily != AF_INET6 {
-            let checksum = calculateChecksum(data: packet)
-            packet[2] = UInt8(checksum >> 8)
-            packet[3] = UInt8(checksum & 0xFF)
+        ICMPPacket.echoRequest(family: addressFamily, identifier: identifier, sequenceNumber: sequenceNumber, payload: payload ?? Data())
+    }
+}
+
+// MARK: - ICMP Packet Encoding
+
+/// Pure ICMP echo encoding/decoding used by SimplePing (no sockets, testable)
+enum ICMPPacket {
+    static let headerSize = 8
+    static let echoRequestV4: UInt8 = 8
+    static let echoReplyV4: UInt8 = 0
+    static let echoRequestV6: UInt8 = 128
+    static let echoReplyV6: UInt8 = 129
+    
+    /// Builds an echo request: type, code 0, checksum, identifier and sequence number in network byte order, payload.
+    /// For ICMPv6 the checksum stays 0 because the kernel computes it (it covers a pseudo-header).
+    static func echoRequest(family: Int32, identifier: UInt16, sequenceNumber: UInt16, payload: Data) -> Data {
+        var packet = Data([family == AF_INET6 ? echoRequestV6 : echoRequestV4, 0, 0, 0,
+                           UInt8(identifier >> 8), UInt8(identifier & 0xFF),
+                           UInt8(sequenceNumber >> 8), UInt8(sequenceNumber & 0xFF)])
+        packet.append(payload)
+        if family != AF_INET6 {
+            let sum = checksum(packet)
+            packet[2] = UInt8(sum >> 8)
+            packet[3] = UInt8(sum & 0xFF)
         }
         return packet
     }
     
+    /// Returns the offset of the ICMP header. IPv4 SOCK_DGRAM ICMP sockets on Darwin
+    /// deliver the IP header too; IPv6 ones do not.
+    static func icmpHeaderOffset(in packet: Data, family: Int32) -> Int? {
+        guard family == AF_INET else { return 0 }
+        guard packet.count >= 20 else { return nil }
+        let versionAndIHL = packet[packet.startIndex]
+        guard versionAndIHL >> 4 == 4 else { return nil }
+        let ipHeaderLength = Int(versionAndIHL & 0x0F) * 4
+        guard ipHeaderLength >= 20, packet[packet.startIndex + 9] == UInt8(IPPROTO_ICMP) else { return nil }
+        return ipHeaderLength
+    }
+    
+    /// Returns the sequence number if the packet is an echo reply to our identifier (valid checksum on IPv4), otherwise nil
+    static func echoReplySequenceNumber(in packet: Data, family: Int32, identifier: UInt16) -> UInt16? {
+        guard let offset = icmpHeaderOffset(in: packet, family: family),
+              packet.count >= offset + headerSize else { return nil }
+        let icmp = Data(packet[(packet.startIndex + offset)...])
+        let type = icmp[0], code = icmp[1]
+        let replyIdentifier = UInt16(icmp[4]) << 8 | UInt16(icmp[5])
+        guard type == (family == AF_INET6 ? echoReplyV6 : echoReplyV4),
+              code == 0,
+              replyIdentifier == identifier,
+              family == AF_INET6 || checksum(icmp) == 0 else { return nil }
+        return UInt16(icmp[6]) << 8 | UInt16(icmp[7])
+    }
+    
     /// Internet checksum (RFC 1071); returns the value in host order, to be written big-endian
-    private func calculateChecksum(data: Data) -> UInt16 {
+    static func checksum(_ data: Data) -> UInt16 {
         var sum: UInt32 = 0
         var index = data.startIndex
         while index + 1 < data.endIndex {
