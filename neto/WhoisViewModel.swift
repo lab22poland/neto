@@ -130,7 +130,7 @@ final class WhoisViewModel: ObservableObject {
     /// Validates if the input is a valid domain name
     private func isDomainName(_ input: String) -> Bool {
         // More comprehensive domain validation
-        let domainRegex = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?\\.[a-zA-Z]{2,}$"
+        let domainRegex = "^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,63}$"
         let domainPredicate = NSPredicate(format: "SELF MATCHES %@", domainRegex)
         return domainPredicate.evaluate(with: input)
     }
