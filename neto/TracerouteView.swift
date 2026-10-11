@@ -40,6 +40,7 @@ struct TracerouteView: View {
             Text("Traceroute Tool")
                 .font(.largeTitle)
                 .fontWeight(.bold)
+                .accessibilityIdentifier("traceroute.header")
             
             Text("Discover the network path to a destination by probing intermediate hops")
                 .font(.subheadline)
@@ -97,6 +98,7 @@ struct TracerouteView: View {
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
                 .disableAutocorrection(true)
+                .accessibilityIdentifier("traceroute.host")
                 .onSubmit {
                     if viewModel.canStartTraceroute {
                         viewModel.startTraceroute()
@@ -117,6 +119,7 @@ struct TracerouteView: View {
                 }
                 .disabled(!viewModel.canStartTraceroute)
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("traceroute.start")
                 
                 if viewModel.isTracing {
                     Button(action: viewModel.stopTraceroute) {

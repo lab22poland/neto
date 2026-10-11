@@ -40,6 +40,7 @@ struct PingView: View {
             Text("Ping Tool")
                 .font(.largeTitle)
                 .fontWeight(.bold)
+                .accessibilityIdentifier("ping.header")
             
             Text("Send ICMP echo packets to test network connectivity")
                 .font(.subheadline)
@@ -55,6 +56,7 @@ struct PingView: View {
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
                 .disableAutocorrection(true)
+                .accessibilityIdentifier("ping.host")
                 .onSubmit {
                     if viewModel.isTargetHostValid && !viewModel.isPinging {
                         viewModel.startPing()
@@ -75,6 +77,7 @@ struct PingView: View {
                 }
                 .disabled(!viewModel.isTargetHostValid || viewModel.isPinging)
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("ping.start")
                 
                 if viewModel.isPinging {
                     Button(action: viewModel.stopPing) {
@@ -83,6 +86,7 @@ struct PingView: View {
                     }
                     .buttonStyle(.bordered)
                     .foregroundColor(.red)
+                    .accessibilityIdentifier("ping.stop")
                 }
                 
                 Button(action: { showConfiguration.toggle() }) {
@@ -175,6 +179,7 @@ struct PingView: View {
                         viewModel.pingResults.removeAll()
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier("ping.clear")
                 }
             }
             
@@ -182,6 +187,7 @@ struct PingView: View {
                 Text("No ping results yet")
                     .foregroundColor(.secondary)
                     .italic()
+                    .accessibilityIdentifier("ping.noResults")
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
@@ -206,6 +212,7 @@ struct PingView: View {
                     VStack(spacing: 4) {
                         HStack {
                             Text("Packets: \(stats.totalPings) sent, \(stats.successCount) received")
+                                .accessibilityIdentifier("ping.stats")
                             Spacer()
                             Text("Loss: \(stats.formattedPacketLoss)")
                                 .foregroundColor(stats.packetLoss > 0 ? .secondary : .primary)

@@ -8,290 +8,153 @@
 
 import XCTest
 
+/// End-to-end user flows. Every test works on macOS, iPad and iPhone (where the split view
+/// collapses into a navigation stack) and needs no internet: ping and traceroute use 127.0.0.1.
 final class netoUITests: XCTestCase {
 
+    private var app: XCUIApplication!
+
     override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-
-        // In UI tests it is usually best to stop immediately when a failure occurs.
         continueAfterFailure = false
-
-        // In UI tests it's important to set the initial state - such as interface orientation - required for your tests before they run. The setUp method is a good place to do this.
-    }
-
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-    }
-
-    @MainActor
-    func testAppLaunch() throws {
-        let app = XCUIApplication()
+        app = XCUIApplication()
         app.launch()
-        
-        // Wait for the app to load and verify main elements exist
-        // On macOS, we use NavigationSplitView, so look for the sidebar elements
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.waitForExistence(timeout: 5))
-        
-        let aboutTool = app.staticTexts["About"]
-        XCTAssertTrue(aboutTool.waitForExistence(timeout: 2))
-        
-        // Verify the default message is shown
-        let defaultMessage = app.staticTexts["Select a tool from the sidebar"]
-        XCTAssertTrue(defaultMessage.waitForExistence(timeout: 2))
     }
 
-    @MainActor
-    func testNavigationElements() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // On macOS, we have a sidebar with tools, not a navigation bar
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.waitForExistence(timeout: 5))
-        
-        let aboutTool = app.staticTexts["About"]
-        XCTAssertTrue(aboutTool.waitForExistence(timeout: 2))
-        
-        // Test that tools are clickable
-        XCTAssertTrue(pingTool.isHittable)
-        XCTAssertTrue(aboutTool.isHittable)
-    }
+    // MARK: - Navigation
 
     @MainActor
-    func testPingToolNavigation() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to ping tool
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.waitForExistence(timeout: 5))
-        pingTool.tap()
-        
-        // Verify ping tool elements exist
-        let pingToolTitle = app.staticTexts["Ping Tool"]
-        XCTAssertTrue(pingToolTitle.waitForExistence(timeout: 3))
-        
-        let targetHostLabel = app.staticTexts["Target Host"]
-        XCTAssertTrue(targetHostLabel.waitForExistence(timeout: 2))
-        
-        let textField = app.textFields.firstMatch
-        XCTAssertTrue(textField.waitForExistence(timeout: 2))
-        
-        let pingButton = app.buttons["Send 5 Ping Packets"]
-        XCTAssertTrue(pingButton.waitForExistence(timeout: 2))
-    }
-
-    @MainActor
-    func testAboutPageNavigation() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to about page
-        let aboutTool = app.staticTexts["About"]
-        XCTAssertTrue(aboutTool.waitForExistence(timeout: 5))
-        aboutTool.tap()
-        
-        // Verify about page content
-        let netoTitle = app.staticTexts["NETo"]
-        XCTAssertTrue(netoTitle.waitForExistence(timeout: 3))
-        
-        let subtitle = app.staticTexts["Network Engineer Tools"]
-        XCTAssertTrue(subtitle.waitForExistence(timeout: 2))
-        
-        let version = app.staticTexts["Version 1.0"]
-        XCTAssertTrue(version.waitForExistence(timeout: 2))
-        
-        let copyright = app.staticTexts["© 2025 Lab22 Poland Sp. z o.o."]
-        XCTAssertTrue(copyright.waitForExistence(timeout: 2))
-    }
-
-    @MainActor
-    func testAboutPageContent() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to about page
-        let aboutTool = app.staticTexts["About"]
-        aboutTool.tap()
-        
-        // Check for specific content sections
-        let aboutSection = app.staticTexts["About NETo"]
-        XCTAssertTrue(aboutSection.waitForExistence(timeout: 3))
-        
-        let currentToolsSection = app.staticTexts["Current Tools"]
-        XCTAssertTrue(currentToolsSection.waitForExistence(timeout: 2))
-        
-        let platformSupportSection = app.staticTexts["Platform Support"]
-        XCTAssertTrue(platformSupportSection.waitForExistence(timeout: 2))
-        
-        let technologiesSection = app.staticTexts["Technologies"]
-        XCTAssertTrue(technologiesSection.waitForExistence(timeout: 2))
-    }
-
-    @MainActor
-    func testPingToolInput() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to ping tool
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.waitForExistence(timeout: 5))
-        pingTool.tap()
-        
-        // Test text field input
-        let textField = app.textFields.firstMatch
-        XCTAssertTrue(textField.waitForExistence(timeout: 3))
-        textField.tap()
-        textField.typeText("8.8.8.8")
-        
-        // Verify text was entered
-        XCTAssertEqual(textField.value as? String, "8.8.8.8")
-        
-        // Verify ping button exists and is enabled
-        let pingButton = app.buttons["Send 5 Ping Packets"]
-        XCTAssertTrue(pingButton.exists)
-        XCTAssertTrue(pingButton.isEnabled)
-    }
-
-    @MainActor
-    func testPingButtonStates() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to ping tool
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.waitForExistence(timeout: 5))
-        pingTool.tap()
-        
-        // Verify button is initially disabled (empty text field)
-        let pingButton = app.buttons["Send 5 Ping Packets"]
-        XCTAssertTrue(pingButton.waitForExistence(timeout: 3))
-        XCTAssertFalse(pingButton.isEnabled)
-        
-        // Add text to enable button
-        let textField = app.textFields.firstMatch
-        textField.tap()
-        textField.typeText("google.com")
-        
-        // Verify button is now enabled
-        XCTAssertTrue(pingButton.isEnabled)
-        
-        // Test that the button remains enabled with valid input
-        // This is the main functionality we want to test
-        XCTAssertTrue(pingButton.isEnabled)
-        
-        // Verify text field contains the entered text
-        XCTAssertEqual(textField.value as? String, "google.com")
-    }
-
-    @MainActor
-    func testNavigationBetweenTools() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to ping tool
-        let pingTool = app.staticTexts["Ping"]
-        pingTool.tap()
-        
-        // Verify we're in ping tool
-        let pingToolTitle = app.staticTexts["Ping Tool"]
-        XCTAssertTrue(pingToolTitle.waitForExistence(timeout: 3))
-        
-        // Navigate to about page
-        let aboutTool = app.staticTexts["About"]
-        aboutTool.tap()
-        
-        // Verify we're in about page
-        let netoTitle = app.staticTexts["NETo"]
-        XCTAssertTrue(netoTitle.waitForExistence(timeout: 3))
-        
-        // Navigate back to ping tool
-        pingTool.tap()
-        
-        // Verify we're back in ping tool
-        XCTAssertTrue(pingToolTitle.waitForExistence(timeout: 3))
-    }
-
-    @MainActor
-    func testAccessibilityElements() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Test accessibility identifiers and labels
-        let pingTool = app.staticTexts["Ping"]
-        XCTAssertTrue(pingTool.exists)
-        
-        let aboutTool = app.staticTexts["About"]
-        XCTAssertTrue(aboutTool.exists)
-        
-        // Navigate to ping tool and test accessibility
-        pingTool.tap()
-        
-        let textField = app.textFields.firstMatch
-        XCTAssertTrue(textField.exists)
-        
-        let pingButton = app.buttons["Send 5 Ping Packets"]
-        XCTAssertTrue(pingButton.exists)
-    }
-
-    @MainActor
-    func testKeyboardInteraction() throws {
-        let app = XCUIApplication()
-        app.launch()
-        
-        // Navigate to ping tool
-        let pingTool = app.staticTexts["Ping"]
-        pingTool.tap()
-        
-        // Test keyboard input
-        let textField = app.textFields.firstMatch
-        textField.tap()
-        textField.typeText("example.com")
-        
-        // Test submitting with Enter key (onSubmit in SwiftUI)
-        // On macOS, pressing return in the text field should trigger the ping action
-        textField.typeText(XCUIKeyboardKey.return.rawValue)
-        
-        // Wait a moment to see if ping starts (button might become disabled)
-        sleep(1)
-        
-        // The ping should have started, so there might be results or the button might show "Stop"
-        // We'll just verify the text field still contains our input
-        XCTAssertEqual(textField.value as? String, "example.com")
-    }
-
-    @MainActor
-    func testLaunchPerformance() throws {
-        if #available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 7.0, *) {
-            // This measures how long it takes to launch your application.
-            measure(metrics: [XCTApplicationLaunchMetric()]) {
-                XCUIApplication().launch()
-            }
+    func testNavigationOpensEveryTool() throws {
+        if !isCompactLayout {
+            XCTAssertTrue(element("detail.placeholder").waitForExistence(timeout: 5))
         }
-    }
-    
-    @MainActor
-    func testMemoryUsage() throws {
-        let app = XCUIApplication()
-        
-        if #available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 7.0, *) {
-            measure(metrics: [XCTMemoryMetric()]) {
-                app.launch()
-                
-                // Navigate between tools to test memory usage
-                let pingTool = app.staticTexts["Ping"]
-                pingTool.tap()
-                
-                let textField = app.textFields.firstMatch
-                textField.tap()
-                textField.typeText("test.com")
-                
-                let aboutTool = app.staticTexts["About"]
-                aboutTool.tap()
-                
-                app.terminate()
-            }
+
+        let tools = [("ping", "ping.header"),
+                     ("traceroute", "traceroute.header"),
+                     ("whois", "whois.header"),
+                     ("arp", "arp.header"),
+                     ("about", "about.header")]
+        for (tool, header) in tools {
+            openTool(tool, expecting: header)
         }
+        // Back to the first tool: selection must still switch after visiting all others
+        openTool("ping", expecting: "ping.header")
+    }
+
+    // MARK: - Ping
+
+    @MainActor
+    func testPingLocalhostReportsReplies() throws {
+        openTool("ping", expecting: "ping.header")
+        let host = element("ping.host")
+        let start = element("ping.start")
+        XCTAssertFalse(start.isEnabled, "Start must be disabled for an empty host")
+
+        host.tap()
+        host.typeText("   ")
+        XCTAssertFalse(start.isEnabled, "Start must be disabled for a whitespace-only host")
+        host.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 3) + "127.0.0.1")
+        XCTAssertTrue(start.isEnabled)
+
+        start.tap()
+        XCTAssertTrue(element("ping.stop").waitForExistence(timeout: 2), "Stop must appear while pinging")
+        // Statistics instead of result rows: the rows are layout-dependent (hidden in a small macOS window)
+        XCTAssertTrue(wait(for: element("ping.stats"), text: "Packets: 5 sent, 5 received", timeout: 15),
+                      "All 5 echo requests to 127.0.0.1 must be answered")
+        XCTAssertTrue(waitForDisappearance(of: element("ping.stop"), timeout: 5), "Stop must disappear after the run")
+        XCTAssertTrue(start.isEnabled, "Start must be enabled again after the run")
+    }
+
+    @MainActor
+    func testPingStartsOnReturnAndClearsResults() throws {
+        openTool("ping", expecting: "ping.header")
+        let host = element("ping.host")
+        host.tap()
+        host.typeText("127.0.0.1\n")
+
+        XCTAssertTrue(element("ping.stats").waitForExistence(timeout: 10), "Return in the host field must start a ping")
+        XCTAssertTrue(waitForDisappearance(of: element("ping.stop"), timeout: 15))
+
+        element("ping.clear").tap()
+        XCTAssertTrue(element("ping.noResults").waitForExistence(timeout: 2))
+        XCTAssertFalse(element("ping.stats").exists, "Statistics must be hidden without results")
+    }
+
+    // MARK: - Traceroute and WHOIS input validation (nothing is sent)
+
+    @MainActor
+    func testTracerouteAndWhoisInputValidation() throws {
+        openTool("traceroute", expecting: "traceroute.header")
+        let tracerouteHost = element("traceroute.host")
+        let tracerouteStart = element("traceroute.start")
+        XCTAssertFalse(tracerouteStart.isEnabled)
+        tracerouteHost.tap()
+        tracerouteHost.typeText("   ")
+        XCTAssertFalse(tracerouteStart.isEnabled, "Whitespace-only host must not be accepted")
+        tracerouteHost.typeText("127.0.0.1")
+        XCTAssertTrue(tracerouteStart.isEnabled)
+
+        openTool("whois", expecting: "whois.header")
+        let query = element("whois.query")
+        let lookup = element("whois.lookup")
+        XCTAssertFalse(lookup.isEnabled)
+        query.tap()
+        query.typeText("!!")
+        XCTAssertFalse(lookup.isEnabled, "Invalid query must not be accepted")
+
+        element("whois.example.ipv4").tap()
+        XCTAssertEqual(query.value as? String, "8.8.8.8", "Example button must fill the query")
+        XCTAssertTrue(lookup.isEnabled)
+    }
+
+    // MARK: - ARP
+
+    @MainActor
+    func testArpTableLoadsWithoutError() throws {
+        openTool("arp", expecting: "arp.header")
+        let entries = element("arp.entries")
+        let empty = element("arp.empty")
+        let loaded = NSPredicate { _, _ in entries.exists || empty.exists }
+        let expectation = XCTNSPredicateExpectation(predicate: loaded, object: nil)
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: 10), .completed, "ARP table never finished loading")
+        XCTAssertFalse(element("arp.error").exists, "ARP refresh must not report an error")
+    }
+
+    // MARK: - Helpers
+
+    /// iPhone: the split view is collapsed, so sidebar and detail are never visible together
+    private var isCompactLayout: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone
+        #else
+        return false
+        #endif
+    }
+
+    private func element(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// Opens a tool from the sidebar; on iPhone first navigates back to the sidebar if a tool is shown
+    private func openTool(_ tool: String, expecting header: String, file: StaticString = #filePath, line: UInt = #line) {
+        // On iOS the Label's identifier lands on both its icon and its text; only the text is hittable
+        let row = app.staticTexts.matching(identifier: "sidebar.\(tool)").firstMatch
+        if isCompactLayout && !row.waitForExistence(timeout: 1) {
+            app.navigationBars.buttons.firstMatch.tap()
+        }
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "Sidebar row \(tool) not reachable", file: file, line: line)
+        row.tap()
+        XCTAssertTrue(element(header).waitForExistence(timeout: 5), "\(tool) did not open", file: file, line: line)
+    }
+
+    /// Static text is exposed as `label` on iOS and as `value` on macOS
+    private func wait(for element: XCUIElement, text: String, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate(format: "label == %@ OR value == %@", text, text)
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForDisappearance(of element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: element)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 }

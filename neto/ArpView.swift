@@ -38,6 +38,7 @@ struct ArpView: View {
             Text("ARP Browser")
                 .font(.largeTitle)
                 .fontWeight(.bold)
+                .accessibilityIdentifier("arp.header")
             
             Text("Browse the system's Address Resolution Protocol (ARP) table")
                 .font(.subheadline)
@@ -98,6 +99,7 @@ struct ArpView: View {
                             Text(errorMessage)
                     .foregroundColor(.secondary)
                     .font(.caption)
+                    .accessibilityIdentifier("arp.error")
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -172,6 +174,7 @@ struct ArpView: View {
                     .foregroundColor(.secondary)
                 Text("No ARP entries found")
                     .font(.headline)
+                    .accessibilityIdentifier("arp.empty")
                     .foregroundColor(.secondary)
                 Text("for interface \(viewModel.selectedInterface)")
                     .font(.caption)
@@ -182,6 +185,7 @@ struct ArpView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("ARP Entries (\(viewModel.selectedInterface))")
                     .font(.headline)
+                    .accessibilityIdentifier("arp.entries")
                 
                 tableOutputView
             }

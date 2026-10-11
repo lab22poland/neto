@@ -31,6 +31,7 @@ struct ContentView: View {
             } else {
                 Text("Select a tool from the sidebar")
                     .foregroundColor(.secondary)
+                    .accessibilityIdentifier("detail.placeholder")
             }
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 250)
@@ -43,6 +44,7 @@ struct ToolsList: View {
     var body: some View {
         List(NetworkTool.allCases, selection: $selectedTool) { tool in
             Label(tool.title, systemImage: tool.icon)
+                .accessibilityIdentifier("sidebar.\(tool.rawValue)")
                 .tag(tool)
         }
         .navigationTitle("NETo")

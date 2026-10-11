@@ -16,7 +16,7 @@ xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=iOS Simul
 # macOS – needs the signing overrides shown (see "Project quirks")
 xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
 xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoTests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
-xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoUITests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=   # ~4 min
+xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoUITests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=   # ~1–1.5 min
 
 # Single test: XCTest method vs. Swift Testing function (note the parentheses)
 xcodebuild ... test -only-testing:netoTests/SimplePingTests/testSimplePingInitialization
@@ -49,7 +49,7 @@ No linter or formatter is configured. All three targets use Xcode file-system sy
   - **Traceroute** – TCP `NWConnection` probes with per-hop timeouts, not a TTL-based traceroute.
   - **WHOIS** – raw TCP port 43 via `NWConnection`, intended as a port of FreeBSD `whois.c` (server constants, suffix→server table, referral prefixes and RIR loop detection are marked "exact match" in comments). Keep it consistent with the reference sources in `Temporary Items/` (`whois.c`, `rfc3912.txt`; untracked, local only) rather than inventing new logic.
   - **ARP** – macOS reads the neighbor cache via `sysctl()` on the routing table; iOS/iPadOS can only list basic interface info.
-- UI tests match on visible label text (there are no accessibility identifiers), so changing user-facing strings can break `netoUITests`.
+- UI tests (`netoUITests`) are a few end-to-end flows that need no internet (ping targets 127.0.0.1; traceroute and WHOIS only check input validation). They find elements by accessibility identifiers (`sidebar.<tool>`, `<tool>.header`, `ping.host`, `ping.start`, `ping.stats`, …), so keep those when changing views and add one for every element a new test touches. On iPhone the split view collapses into a stack; the `openTool` helper navigates back to the sidebar. Static text is exposed as `label` on iOS but as `value` on macOS, so match both. Assert on statistics or other always-visible elements rather than on rows inside scroll views.
 
 ## Conventions
 

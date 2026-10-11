@@ -35,6 +35,7 @@ struct WhoisView: View {
             Text("WHOIS Lookup")
                 .font(.largeTitle)
                 .fontWeight(.bold)
+                .accessibilityIdentifier("whois.header")
             
             Text("RFC 3912 compliant WHOIS queries for domains, IP addresses, AS numbers, and person/organization records")
                 .font(.subheadline)
@@ -50,6 +51,7 @@ struct WhoisView: View {
             TextField("Enter domain, IP address, AS number, or person/organization", text: $viewModel.targetQuery)
                 .textFieldStyle(.roundedBorder)
                 .disableAutocorrection(true)
+                .accessibilityIdentifier("whois.query")
                 .onSubmit {
                     if viewModel.isTargetQueryValid && !viewModel.isLoading {
                         viewModel.startWhoisLookup()
@@ -73,6 +75,7 @@ struct WhoisView: View {
                             .font(.caption)
                             .buttonStyle(.plain)
                             .foregroundColor(.primary)
+                            .accessibilityIdentifier("whois.example.ipv4")
                     }
                     
                     VStack(alignment: .leading, spacing: 2) {
@@ -104,6 +107,7 @@ struct WhoisView: View {
                 }
                 .disabled(!viewModel.isTargetQueryValid || viewModel.isLoading)
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("whois.lookup")
                 
                 if viewModel.isLoading {
                     Button(action: viewModel.stopWhoisLookup) {
