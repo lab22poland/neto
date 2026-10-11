@@ -7,190 +7,236 @@
 //
 
 import Foundation
-import Network
 
-/// Manager class responsible for ping operations and network connectivity testing
-final class PingManager {
+/// Sends ICMP echo requests through SimplePing and reports one PingResult per packet
+final class PingManager: NSObject {
     
-    /// Performs a series of ping operations to the specified host
+    // MARK: - Types
+    
+    /// Configuration for ping operations
+    struct PingConfig {
+        let count: Int
+        let interval: TimeInterval
+        let timeout: TimeInterval
+        let payloadSize: Int
+        
+        static let `default` = PingConfig(
+            count: 5,
+            interval: 1.0,
+            timeout: 5.0,
+            payloadSize: 56
+        )
+    }
+    
+    /// Internal state for tracking ping operations
+    private struct PingState {
+        let startTime: Date
+        let sequenceNumber: UInt16
+        var sentTime: Date?
+        var receivedTime: Date?
+        var isComplete: Bool = false
+    }
+    
+    // MARK: - Properties
+    // All mutable state is touched only on the main actor (SimplePing delivers callbacks on the main queue).
+    
+    private var simplePing: SimplePing?
+    private var pingStates: [UInt16: PingState] = [:]   // keyed by the ICMP sequence number SimplePing used
+    private var displaySequence: [UInt16: Int] = [:]     // ICMP seq -> 1-based sequence shown to the caller
+    private var currentConfig: PingConfig = .default
+    private var onResult: ((PingResult) -> Void)?
+    private var pingTask: Task<Void, Never>?
+    private var sendingIndex = 0
+    private var runtimeError: Error?
+    private var startContinuation: CheckedContinuation<Error?, Never>?
+    
+    // MARK: - Public Methods
+    
+    /// Pings the host with ICMP echo requests
     /// - Parameters:
     ///   - host: The target host (IP address or domain name)
-    ///   - count: Number of ping packets to send (default: 5)
-    ///   - interval: Interval between pings in seconds (default: 1.0)
-    ///   - onResult: Callback called for each ping result
-    ///   - onComplete: Callback called when all pings are complete
+    ///   - config: Packet count, interval, per-packet timeout and payload size
+    ///   - onResult: Called on the main actor for each reply, timeout or error
+    ///   - onComplete: Called exactly once when the run ends, including after cancellation
     /// - Returns: A Task that can be cancelled
     func performPing(
         to host: String,
-        count: Int = 5,
-        interval: TimeInterval = 1.0,
+        config: PingConfig = .default,
         onResult: @escaping (PingResult) -> Void,
         onComplete: @escaping () -> Void
     ) -> Task<Void, Never> {
-        return Task {
-            await executePingSequence(
-                host: host,
-                count: count,
-                interval: interval,
-                onResult: onResult,
-                onComplete: onComplete
-            )
-        }
-    }
-    
-    /// Executes a sequence of ping operations
-    private func executePingSequence(
-        host: String,
-        count: Int,
-        interval: TimeInterval,
-        onResult: @escaping (PingResult) -> Void,
-        onComplete: @escaping () -> Void
-    ) async {
-        for sequenceNumber in 1...count {
-            // Check if task was cancelled
-            if Task.isCancelled {
-                return
-            }
-            
-            let startTime = Date()
-            
-            do {
-                let isReachable = try await checkHostReachability(host)
-                let endTime = Date()
-                let responseTime = endTime.timeIntervalSince(startTime) * 1000 // Convert to milliseconds
-                
-                let result = PingResult(
-                    id: UUID(),
-                    sequenceNumber: sequenceNumber,
-                    success: isReachable,
-                    responseTime: responseTime,
-                    message: isReachable 
-                        ? String(format: "Reply from %@: time=%.2fms seq=%d", host, responseTime, sequenceNumber)
-                        : String(format: "Request timeout seq=%d", sequenceNumber)
-                )
-                
-                await MainActor.run {
-                    onResult(result)
-                }
-                
-            } catch {
-                // Check if task was cancelled
-                if Task.isCancelled {
-                    return
-                }
-                
-                let result = PingResult(
-                    id: UUID(),
-                    sequenceNumber: sequenceNumber,
-                    success: false,
-                    responseTime: 0,
-                    message: String(format: "Error seq=%d: %@", sequenceNumber, error.localizedDescription)
-                )
-                
-                await MainActor.run {
-                    onResult(result)
-                }
-            }
-            
-            // Add delay between pings, but check for cancellation
-            if sequenceNumber < count {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                } catch {
-                    // Task was cancelled during sleep
-                    return
-                }
-            }
-        }
-        
-        await MainActor.run {
+        // Runs share this manager's state, so a new run waits until the previous (cancelled) one has finished.
+        let previousTask = pingTask
+        previousTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { onComplete(); return }
+            await self.executePingSequence(host: host, config: config, onResult: onResult)
+            self.finish()
             onComplete()
         }
+        pingTask = task
+        return task
     }
     
-    /// Checks if a host is reachable using Network framework
-    /// - Parameter host: The target host to check
-    /// - Returns: Boolean indicating if the host is reachable
-    /// - Throws: Network errors if connection fails for reasons other than unreachability
-    private func checkHostReachability(_ host: String) async throws -> Bool {
-        return try await withTaskCancellationHandler {
-            return try await withCheckedThrowingContinuation { continuation in
-                let queue = DispatchQueue(label: "ping.monitor")
-                
-                // Create endpoint based on host type
-                let endpoint: NWEndpoint
-                
-                if let ipv4 = IPv4Address(host) {
-                    endpoint = .hostPort(host: .ipv4(ipv4), port: 80)
-                } else if let ipv6 = IPv6Address(host) {
-                    endpoint = .hostPort(host: .ipv6(ipv6), port: 80)
-                } else {
-                    endpoint = .hostPort(host: .name(host, nil), port: 80)
-                }
-                
-                // Use UDP for a more ping-like experience (lighter weight than TCP)
-                let parameters = NWParameters.udp
-                parameters.prohibitExpensivePaths = false
-                parameters.prohibitConstrainedPaths = false
-                
-                let connection = NWConnection(to: endpoint, using: parameters)
-                var hasCompleted = false
-                let lock = NSLock()
-                
-                connection.stateUpdateHandler = { state in
-                    lock.lock()
-                    defer { lock.unlock() }
-                    
-                    guard !hasCompleted else { return }
-                    
-                    switch state {
-                    case .ready:
-                        hasCompleted = true
-                        connection.cancel()
-                        continuation.resume(returning: true)
-                    case .failed(let error):
-                        hasCompleted = true
-                        connection.cancel()
-                        // For network unreachable errors, treat as timeout rather than error
-                        if let nwError = error as? NWError {
-                            switch nwError {
-                            case .dns(DNSServiceErrorType(kDNSServiceErr_NoSuchRecord)):
-                                continuation.resume(returning: false)
-                            case .posix(let posixError) where posixError == .ENETUNREACH:
-                                continuation.resume(returning: false)
-                            case .posix(let posixError) where posixError == .EHOSTUNREACH:
-                                continuation.resume(returning: false)
-                            case .posix(let posixError) where posixError == .ETIMEDOUT:
-                                continuation.resume(returning: false)
-                            default:
-                                continuation.resume(throwing: error)
-                            }
-                        } else {
-                            continuation.resume(throwing: error)
-                        }
-                    case .cancelled:
-                        hasCompleted = true
-                        continuation.resume(returning: false)
-                    default:
-                        break
-                    }
-                }
-                
-                connection.start(queue: queue)
-                
-                // Timeout after 5 seconds
-                DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {
-                    lock.lock()
-                    defer { lock.unlock() }
-                    
-                    guard !hasCompleted else { return }
-                    hasCompleted = true
-                    connection.cancel()
-                    continuation.resume(returning: false)
-                }
+    /// Stops the current ping operation; onComplete is still called once, no further results are delivered.
+    func stopPing() {
+        pingTask?.cancel()
+    }
+    
+    // MARK: - Private Methods
+    
+    @MainActor
+    private func executePingSequence(host: String, config: PingConfig, onResult: @escaping (PingResult) -> Void) async {
+        guard !Task.isCancelled, config.count > 0 else { return }
+        
+        currentConfig = config
+        self.onResult = onResult
+        pingStates.removeAll()
+        displaySequence.removeAll()
+        runtimeError = nil
+        
+        let pinger = SimplePing(hostName: host, identifier: UInt16.random(in: 1...UInt16.max), delegate: self)
+        simplePing = pinger
+        
+        // Wait for didStart / didFail instead of a fixed 1 s sleep.
+        let startError: Error? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                startContinuation = continuation
+                pinger.start()
             }
         } onCancel: {
-            // This handler will be called when the task is cancelled
+            Task { @MainActor in self.resumeStart(with: CancellationError()) }
+        }
+        if Task.isCancelled { return }
+        if let startError {
+            deliver(PingResult(id: UUID(), sequenceNumber: 1, success: false, responseTime: 0,
+                               message: "Failed to start ping: \(startError.localizedDescription)"))
+            return
+        }
+        
+        for i in 0..<config.count {
+            if Task.isCancelled { return }
+            let sendTime = Date()
+            sendingIndex = i + 1
+            if let seq = pinger.sendPingWithPayload(createPayload(size: config.payloadSize)) {
+                displaySequence[seq] = i + 1
+                pingStates[seq] = PingState(startTime: sendTime, sequenceNumber: seq, sentTime: sendTime)
+            } else if let runtimeError {
+                deliver(PingResult(id: UUID(), sequenceNumber: i + 1, success: false, responseTime: 0,
+                                   message: "Ping failed seq=\(i + 1): \(runtimeError.localizedDescription)"))
+            }
+            // Expire anything overdue so results keep their order.
+            expireTimedOutPings()
+            if i < config.count - 1 {
+                do { try await Task.sleep(nanoseconds: UInt64(config.interval * 1_000_000_000)) } catch { return }
+            }
+        }
+        await waitForCompletion()
+    }
+    
+    @MainActor
+    private func waitForCompletion() async {
+        while !Task.isCancelled, pingStates.values.contains(where: { !$0.isComplete }) {
+            expireTimedOutPings()
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
-} 
+    
+    @MainActor
+    private func expireTimedOutPings() {
+        for seq in pingStates.keys.sorted(by: { displaySequence[$0, default: 0] < displaySequence[$1, default: 0] }) {
+            if let state = pingStates[seq], !state.isComplete,
+               Date().timeIntervalSince(state.startTime) >= currentConfig.timeout {
+                handlePingTimeout(sequenceNumber: seq)
+            }
+        }
+    }
+    
+    @MainActor
+    private func handlePingTimeout(sequenceNumber: UInt16) {
+        guard var state = pingStates[sequenceNumber], !state.isComplete else { return }
+        state.isComplete = true
+        pingStates[sequenceNumber] = state
+        let display = displaySequence[sequenceNumber, default: Int(sequenceNumber) + 1]
+        deliver(PingResult(id: UUID(), sequenceNumber: display, success: false, responseTime: 0,
+                           message: String(format: "Request timeout seq=%d", display)))
+    }
+    
+    @MainActor
+    private func deliver(_ result: PingResult) {
+        guard !Task.isCancelled, pingTask?.isCancelled != true else { return }
+        onResult?(result)
+    }
+    
+    @MainActor
+    private func resumeStart(with error: Error?) {
+        startContinuation?.resume(returning: error)
+        startContinuation = nil
+    }
+    
+    @MainActor
+    private func finish() {
+        resumeStart(with: CancellationError())
+        simplePing?.stop()
+        simplePing = nil
+        pingStates.removeAll()
+        displaySequence.removeAll()
+        onResult = nil
+    }
+    
+    private func createPayload(size: Int) -> Data {
+        Data((0..<size).map { UInt8($0 % 256) })
+    }
+}
+
+// MARK: - SimplePing Delegate (called on the main queue)
+
+extension PingManager: SimplePing.Delegate {
+    
+    func simplePing(_ pinger: SimplePing, didStartWithAddress address: Data) {
+        MainActor.assumeIsolated { resumeStart(with: nil) }
+    }
+    
+    func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {
+        MainActor.assumeIsolated {
+            if startContinuation != nil { resumeStart(with: error); return }
+            runtimeError = error
+            // Fail outstanding pings right away (in order) instead of letting them time out later.
+            for seq in pingStates.keys.sorted(by: { displaySequence[$0, default: 0] < displaySequence[$1, default: 0] }) {
+                guard var state = pingStates[seq], !state.isComplete else { continue }
+                state.isComplete = true
+                pingStates[seq] = state
+                let display = displaySequence[seq, default: Int(seq) + 1]
+                deliver(PingResult(id: UUID(), sequenceNumber: display, success: false, responseTime: 0,
+                                   message: "Ping failed seq=\(display): \(error.localizedDescription)"))
+            }
+        }
+    }
+    
+    func simplePing(_ pinger: SimplePing, didSendPacket packet: Data, sequenceNumber: UInt16) {}
+    
+    func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error) {
+        MainActor.assumeIsolated {
+            let display = sendingIndex
+            deliver(PingResult(id: UUID(), sequenceNumber: display, success: false, responseTime: 0,
+                               message: String(format: "Failed to send packet seq=%d: %@", display, error.localizedDescription)))
+        }
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16) {
+        MainActor.assumeIsolated {
+            guard pinger === simplePing, var state = pingStates[sequenceNumber], !state.isComplete else { return }
+            let now = Date()
+            state.receivedTime = now
+            state.isComplete = true
+            pingStates[sequenceNumber] = state
+            let responseTime = now.timeIntervalSince(state.sentTime ?? state.startTime) * 1000
+            let display = displaySequence[sequenceNumber, default: Int(sequenceNumber) + 1]
+            deliver(PingResult(id: UUID(), sequenceNumber: display, success: true, responseTime: responseTime,
+                               message: String(format: "Reply from %@: time=%.2fms seq=%d", pinger.targetHostName, responseTime, display)))
+        }
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data) {}
+}

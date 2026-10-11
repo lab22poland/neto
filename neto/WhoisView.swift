@@ -21,9 +21,6 @@ struct WhoisView: View {
         }
         .padding()
         .navigationTitle("WHOIS")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isLoading {
                 viewModel.stopWhoisLookup()
@@ -52,13 +49,7 @@ struct WhoisView: View {
             
             TextField("Enter domain, IP address, AS number, or person/organization", text: $viewModel.targetQuery)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.isTargetQueryValid && !viewModel.isLoading {
                         viewModel.startWhoisLookup()
@@ -76,24 +67,24 @@ struct WhoisView: View {
                         Button("google.com") { viewModel.targetQuery = "google.com" }
                             .font(.caption)
                             .buttonStyle(.plain)
-                            .foregroundColor(.blue)
+                            .foregroundColor(.primary)
                         
                         Button("8.8.8.8") { viewModel.targetQuery = "8.8.8.8" }
                             .font(.caption)
                             .buttonStyle(.plain)
-                            .foregroundColor(.blue)
+                            .foregroundColor(.primary)
                     }
                     
                     VStack(alignment: .leading, spacing: 2) {
                         Button("AS15169") { viewModel.targetQuery = "AS15169" }
                             .font(.caption)
                             .buttonStyle(.plain)
-                            .foregroundColor(.blue)
+                            .foregroundColor(.primary)
                         
                         Button("2001:4860:4860::8888") { viewModel.targetQuery = "2001:4860:4860::8888" }
                             .font(.caption)
                             .buttonStyle(.plain)
-                            .foregroundColor(.blue)
+                            .foregroundColor(.primary)
                     }
                 }
             }
@@ -120,7 +111,7 @@ struct WhoisView: View {
                             .frame(minWidth: 60, minHeight: 32)
                     }
                     .buttonStyle(.bordered)
-                    .foregroundColor(.red)
+                    .foregroundColor(.secondary)
                 }
                 
                 if let result = viewModel.whoisResult {
@@ -136,7 +127,7 @@ struct WhoisView: View {
     private var errorSection: some View {
         if let errorMessage = viewModel.errorMessage {
             Text(errorMessage)
-                .foregroundColor(.red)
+                .foregroundColor(.secondary)
                 .font(.caption)
         }
     }
@@ -158,7 +149,7 @@ struct WhoisView: View {
                     }
                     
                     Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundColor(result.success ? .green : .red)
+                        .foregroundColor(result.success ? .primary : .secondary)
                 }
                 
                 // Quick info section for successful results
@@ -221,7 +212,7 @@ struct WhoisView: View {
                 ScrollView {
                     Text(result.success ? result.rawResponse : result.statusMessage)
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(result.success ? .primary : .red)
+                        .foregroundColor(result.success ? .primary : .secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding()

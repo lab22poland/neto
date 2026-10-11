@@ -7,6 +7,9 @@
 //
 
 import SwiftUI
+#if !os(macOS)
+import UIKit
+#endif
 
 struct TracerouteView: View {
     @StateObject private var viewModel = TracerouteViewModel()
@@ -23,9 +26,6 @@ struct TracerouteView: View {
         }
         .padding()
         .navigationTitle("Traceroute")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-#endif
         .onKeyPress(.escape) {
             if viewModel.isTracing {
                 viewModel.stopTraceroute()
@@ -85,7 +85,7 @@ struct TracerouteView: View {
             }
         }
         .padding()
-        .background(Color.gray.opacity(0.1))
+        .background(.quaternary)
         .cornerRadius(8)
     }
     
@@ -96,13 +96,7 @@ struct TracerouteView: View {
             
             TextField("Enter IPv4, IPv6 address or domain name", text: $viewModel.targetHost)
                 .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                .autocapitalization(.none)
-#endif
                 .disableAutocorrection(true)
-#if os(macOS)
-                .frame(maxWidth: 400)
-#endif
                 .onSubmit {
                     if viewModel.canStartTraceroute {
                         viewModel.startTraceroute()
@@ -130,7 +124,7 @@ struct TracerouteView: View {
                             .frame(minWidth: 60, minHeight: 32)
                     }
                     .buttonStyle(.bordered)
-                    .foregroundColor(.red)
+                    .foregroundColor(.secondary)
                 }
                 
                 if !viewModel.tracerouteResults.isEmpty && !viewModel.isTracing {
@@ -155,13 +149,13 @@ struct TracerouteView: View {
             if let errorMessage = viewModel.errorMessage {
                 HStack {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
+                        .foregroundColor(.secondary)
                     Text(errorMessage)
-                        .foregroundColor(.orange)
+                        .foregroundColor(.secondary)
                     Spacer()
                 }
                 .padding()
-                .background(Color.orange.opacity(0.1))
+                .background(.quaternary)
                 .cornerRadius(8)
             }
         }
@@ -186,9 +180,9 @@ struct TracerouteView: View {
                     if viewModel.destinationReached {
                         HStack {
                             Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
+                                .foregroundColor(.primary)
                             Text("Destination reached")
-                                .foregroundColor(.green)
+                                .foregroundColor(.primary)
                                 .font(.caption)
                         }
                     } else if viewModel.isTracing {
@@ -197,7 +191,7 @@ struct TracerouteView: View {
                                 .scaleEffect(0.5)
                                 .frame(width: 10, height: 10)
                             Text("Tracing route...")
-                                .foregroundColor(.blue)
+                                .foregroundColor(.secondary)
                                 .font(.caption)
                         }
                     }
@@ -222,7 +216,7 @@ struct TracerouteView: View {
                         .padding(.vertical, 4)
                     }
                     .frame(maxHeight: 300)
-                    .background(Color.gray.opacity(0.1))
+                    .background(.quaternary)
                     .cornerRadius(8)
                 }
             }
@@ -232,22 +226,13 @@ struct TracerouteView: View {
     private func shareResults() {
         let results = viewModel.exportResults()
         
-#if os(macOS)
+        #if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(results, forType: .string)
-#else
-        let activityController = UIActivityViewController(
-            activityItems: [results],
-            applicationActivities: nil
-        )
-        
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let window = windowScene.windows.first,
-           let rootViewController = window.rootViewController {
-            rootViewController.present(activityController, animated: true)
-        }
-#endif
+        #else
+        UIPasteboard.general.string = results
+        #endif
     }
 }
 
@@ -272,7 +257,7 @@ struct TracerouteResultRow: View {
                 if result.success && result.responseTime > 0 {
                     Text(String(format: "%.2f ms", result.responseTime))
                         .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(.green)
+                        .foregroundColor(.primary)
                 }
             }
             
@@ -299,9 +284,9 @@ struct TracerouteResultRow: View {
     
     private var statusColor: Color {
         if result.isDestination {
-            return .green
+            return .primary
         } else if result.success {
-            return .blue
+            return .primary
         } else {
             return .secondary
         }
