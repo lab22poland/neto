@@ -37,7 +37,7 @@ final class SimplePing: NSObject {
         func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data)
     }
     
-    /// ICMP header structure
+    /// ICMP header structure (fields stored in network byte order on the wire)
     private struct ICMPHeader {
         var type: UInt8
         var code: UInt8
@@ -49,8 +49,8 @@ final class SimplePing: NSObject {
             self.type = type
             self.code = code
             self.checksum = 0
-            self.identifier = identifier
-            self.sequenceNumber = sequenceNumber
+            self.identifier = identifier.bigEndian
+            self.sequenceNumber = sequenceNumber.bigEndian
         }
     }
     
@@ -58,6 +58,8 @@ final class SimplePing: NSObject {
     
     private let ICMP_ECHO_REQUEST: UInt8 = 8
     private let ICMP_ECHO_REPLY: UInt8 = 0
+    private let ICMP6_ECHO_REQUEST: UInt8 = 128
+    private let ICMP6_ECHO_REPLY: UInt8 = 129
     private let ICMP_TIMEOUT: UInt8 = 11
     
     // MARK: - Properties
@@ -69,6 +71,8 @@ final class SimplePing: NSObject {
     private var hostAddress: Data?
     private var socketAddress: Data?
     private var socket: Int32 = -1
+    private var readSource: DispatchSourceRead?
+    private var addressFamily: Int32 = AF_INET
     private var nextSequenceNumber: UInt16 = 0
     
     // MARK: - Initialization
@@ -102,10 +106,14 @@ final class SimplePing: NSObject {
     
     /// Stops the ping operation
     func stop() {
-        if socket != -1 {
+        if let readSource = readSource {
+            // The cancel handler closes the descriptor, so the reader never sees a reused fd.
+            readSource.cancel()
+            self.readSource = nil
+        } else if socket != -1 {
             close(socket)
-            socket = -1
         }
+        socket = -1
         hostAddress = nil
         socketAddress = nil
     }
@@ -115,7 +123,7 @@ final class SimplePing: NSObject {
     /// - Returns: The sequence number of the sent packet, or nil if failed
     @discardableResult
     func sendPingWithPayload(_ payload: Data? = nil) -> UInt16? {
-        guard let hostAddress = hostAddress,
+        guard hostAddress != nil,
               let socketAddress = socketAddress,
               socket != -1 else {
             return nil
@@ -134,11 +142,12 @@ final class SimplePing: NSObject {
             sendto(socket, packetBytes.baseAddress, packetBytes.count, 0, socketAddress.withUnsafeBytes { $0.bindMemory(to: sockaddr.self).baseAddress }, socklen_t(socketAddress.count))
         }
         
+        let sendErrno = errno
         if bytesSent == packet.count {
             delegate?.simplePing(self, didSendPacket: packet, sequenceNumber: sequenceNumber)
             return sequenceNumber
         } else {
-            let error = POSIXError(.init(rawValue: errno)!)
+            let error = POSIXError(POSIXErrorCode(rawValue: bytesSent < 0 ? sendErrno : EMSGSIZE) ?? .EIO)
             delegate?.simplePing(self, didFailToSendPacket: packet, sequenceNumber: sequenceNumber, error: error)
             return nil
         }
@@ -155,7 +164,6 @@ final class SimplePing: NSObject {
             var hints = addrinfo()
             hints.ai_family = AF_UNSPEC
             hints.ai_socktype = SOCK_DGRAM
-            hints.ai_protocol = IPPROTO_ICMP
             
             var result: UnsafeMutablePointer<addrinfo>?
             let status = getaddrinfo(self.hostName, nil, &hints, &result)
@@ -167,7 +175,8 @@ final class SimplePing: NSObject {
             }
             
             guard status == 0, let addrInfo = result else {
-                let error = POSIXError(.init(rawValue: status)!)
+                let message = String(cString: gai_strerror(status))
+                let error = NSError(domain: "SimplePing.getaddrinfo", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message])
                 DispatchQueue.main.async {
                     self.delegate?.simplePing(self, didFailWithError: error)
                 }
@@ -189,156 +198,124 @@ final class SimplePing: NSObject {
     private func setupSocket() {
         guard let hostAddress = hostAddress else { return }
         
-        // Determine the address family
-        let addressFamily: Int32
-        if hostAddress.count >= MemoryLayout<sockaddr_in>.size {
-            let sockaddr = hostAddress.withUnsafeBytes { rawBuffer in
-                let ptr = UnsafeRawPointer(rawBuffer.baseAddress!).assumingMemoryBound(to: Darwin.sockaddr.self)
-                return ptr.pointee
-            }
-            addressFamily = Int32(sockaddr.sa_family)
-        } else {
-            addressFamily = AF_INET // Default to IPv4
-        }
+        addressFamily = hostAddress.withUnsafeBytes { Int32($0.load(fromByteOffset: 1, as: UInt8.self)) } // sa_family
+        let proto = addressFamily == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP
         
-        // Create the socket
-        socket = Darwin.socket(addressFamily, SOCK_DGRAM, IPPROTO_ICMP)
-        
+        socket = Darwin.socket(addressFamily, SOCK_DGRAM, proto)
         guard socket != -1 else {
-            let error = POSIXError(.init(rawValue: errno)!)
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             delegate?.simplePing(self, didFailWithError: error)
             return
         }
         
-        // Set socket options for non-blocking operation
-        var value: Int32 = 1
-        setsockopt(socket, SOL_SOCKET, O_NONBLOCK, &value, socklen_t(MemoryLayout<Int32>.size))
+        let flags = fcntl(socket, F_GETFL)
+        _ = fcntl(socket, F_SETFL, flags | O_NONBLOCK)
         
-        // Start receiving responses
         startReceiving()
-        
-        // Notify delegate that we've started
         delegate?.simplePing(self, didStartWithAddress: hostAddress)
     }
     
-    /// Starts receiving ICMP responses
+    /// Starts receiving ICMP responses using a dispatch read source on the main queue
     private func startReceiving() {
-        let queue = DispatchQueue.global(qos: .userInitiated)
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            let bufferSize = 65535
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-            defer { buffer.deallocate() }
-            
-            while self.socket != -1 {
-                let bytesRead = recv(self.socket, buffer, bufferSize, 0)
-                
-                if bytesRead > 0 {
-                    let packetData = Data(bytes: buffer, count: bytesRead)
-                    self.processReceivedPacket(packetData)
-                } else if bytesRead == -1 {
-                    let errorCode = errno
-                    if errorCode == EAGAIN || errorCode == EWOULDBLOCK {
-                        // No data available, continue
-                        usleep(10000) // 10ms
-                        continue
-                    } else {
-                        // Error occurred
-                        break
-                    }
-                } else {
-                    // Connection closed
-                    break
-                }
+        let fd = socket
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.readData(fd: fd)
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        readSource = source
+        source.resume()
+    }
+    
+    private func readData(fd: Int32) {
+        var buffer = [UInt8](repeating: 0, count: 65535)
+        while true {
+            let bytesRead = recv(fd, &buffer, buffer.count, 0)
+            if bytesRead < 0 {
+                let err = errno
+                if err == EAGAIN || err == EWOULDBLOCK || err == EINTR { return }
+                // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source.
+                readSource?.cancel()
+                readSource = nil
+                socket = -1
+                delegate?.simplePing(self, didFailWithError: POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
+                return
             }
+            guard bytesRead > 0 else { return }
+            processReceivedPacket(Data(buffer[0..<bytesRead]))
         }
     }
     
-    /// Processes a received ICMP packet
+    /// Returns the offset of the ICMP header. IPv4 SOCK_DGRAM ICMP sockets on Darwin
+    /// deliver the IP header too; IPv6 ones do not.
+    private func icmpHeaderOffset(in packet: Data) -> Int? {
+        guard addressFamily == AF_INET else { return 0 }
+        guard packet.count >= 20 else { return nil }
+        let versionAndIHL = packet[packet.startIndex]
+        guard versionAndIHL >> 4 == 4 else { return nil }
+        let ipHeaderLength = Int(versionAndIHL & 0x0F) * 4
+        guard packet[packet.startIndex + 9] == UInt8(IPPROTO_ICMP) else { return nil }
+        return ipHeaderLength
+    }
+    
+    /// Processes a received ICMP packet (always called on the main queue)
     private func processReceivedPacket(_ packetData: Data) {
-        guard packetData.count >= MemoryLayout<ICMPHeader>.size else { return }
+        guard let offset = icmpHeaderOffset(in: packetData),
+              packetData.count >= offset + MemoryLayout<ICMPHeader>.size else {
+            delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
+            return
+        }
+        let icmp = packetData.subdata(in: (packetData.startIndex + offset)..<packetData.endIndex)
+        let header = icmp.withUnsafeBytes { $0.loadUnaligned(as: ICMPHeader.self) }
+        let replyType = addressFamily == AF_INET6 ? ICMP6_ECHO_REPLY : ICMP_ECHO_REPLY
         
-        let header = packetData.withUnsafeBytes { $0.bindMemory(to: ICMPHeader.self).baseAddress!.pointee }
-        
-        switch header.type {
-        case ICMP_ECHO_REPLY:
-            if header.identifier == identifier {
-                DispatchQueue.main.async {
-                    self.delegate?.simplePing(self, didReceivePingResponsePacket: packetData, sequenceNumber: header.sequenceNumber)
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
-                }
-            }
-            
-        case ICMP_TIMEOUT:
-            // TTL exceeded, could be used for traceroute
-            DispatchQueue.main.async {
-                self.delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
-            }
-            
-        default:
-            // Other ICMP message types
-            DispatchQueue.main.async {
-                self.delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
-            }
+        if header.type == replyType,
+           header.code == 0,
+           UInt16(bigEndian: header.identifier) == identifier,
+           addressFamily == AF_INET6 || calculateChecksum(data: icmp) == 0 {
+            delegate?.simplePing(self, didReceivePingResponsePacket: icmp, sequenceNumber: UInt16(bigEndian: header.sequenceNumber))
+        } else {
+            delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
         }
     }
     
     /// Creates an ICMP echo request packet
     private func createICMPPacket(sequenceNumber: UInt16, payload: Data?) -> Data? {
         var header = ICMPHeader(
-            type: ICMP_ECHO_REQUEST,
+            type: addressFamily == AF_INET6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO_REQUEST,
             code: 0,
             identifier: identifier,
             sequenceNumber: sequenceNumber
         )
-        
-        // Calculate checksum
-        header.checksum = calculateChecksum(header: header, payload: payload)
-        
-        // Create the packet
-        var packet = Data()
-        packet.append(Data(bytes: &header, count: MemoryLayout<ICMPHeader>.size))
-        
+        var packet = Data(bytes: &header, count: MemoryLayout<ICMPHeader>.size)
         if let payload = payload {
             packet.append(payload)
         }
-        
+        // For ICMPv6 the kernel computes the checksum (it covers a pseudo-header).
+        if addressFamily != AF_INET6 {
+            let checksum = calculateChecksum(data: packet)
+            packet[2] = UInt8(checksum >> 8)
+            packet[3] = UInt8(checksum & 0xFF)
+        }
         return packet
     }
     
-    /// Calculates the ICMP checksum
-    private func calculateChecksum(header: ICMPHeader, payload: Data?) -> UInt16 {
-        var headerCopy = header
-        headerCopy.checksum = 0
-        
-        var data = Data()
-        data.append(Data(bytes: &headerCopy, count: MemoryLayout<ICMPHeader>.size))
-        
-        if let payload = payload {
-            data.append(payload)
-        }
-        
-        // Ensure even length for checksum calculation
-        if data.count % 2 != 0 {
-            data.append(0)
-        }
-        
+    /// Internet checksum (RFC 1071); returns the value in host order, to be written big-endian
+    private func calculateChecksum(data: Data) -> UInt16 {
         var sum: UInt32 = 0
-        data.withUnsafeBytes { bytes in
-            let words = bytes.bindMemory(to: UInt16.self)
-            for word in words {
-                sum += UInt32(word.bigEndian)
-            }
+        var index = data.startIndex
+        while index + 1 < data.endIndex {
+            sum += UInt32(data[index]) << 8 | UInt32(data[index + 1])
+            index += 2
         }
-        
+        if index < data.endIndex {
+            sum += UInt32(data[index]) << 8
+        }
         while sum > 0xFFFF {
             sum = (sum & 0xFFFF) + (sum >> 16)
         }
-        
-        return UInt16(truncatingIfNeeded: ~sum).bigEndian
+        return ~UInt16(sum)
     }
-} 
+}

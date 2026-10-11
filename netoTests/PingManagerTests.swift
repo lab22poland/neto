@@ -1,5 +1,5 @@
 //
-//  PingManagerV2Tests.swift
+//  PingManagerTests.swift
 //  netoTests
 //
 //  Created by Sergii Solianyk on 21/06/2025.
@@ -9,17 +9,17 @@
 import XCTest
 @testable import neto
 
-/// Unit tests for PingManagerV2 implementation
-final class PingManagerV2Tests: XCTestCase {
+/// Unit tests for PingManager implementation
+final class PingManagerTests: XCTestCase {
     
     // MARK: - Test Properties
     
-    private var pingManager: PingManagerV2!
+    private var pingManager: PingManager!
     
     // MARK: - Setup and Teardown
     
     override func setUpWithError() throws {
-        pingManager = PingManagerV2()
+        pingManager = PingManager()
     }
     
     override func tearDownWithError() throws {
@@ -30,7 +30,7 @@ final class PingManagerV2Tests: XCTestCase {
     // MARK: - Configuration Tests
     
     func testDefaultConfiguration() throws {
-        let config = PingManagerV2.PingConfig.default
+        let config = PingManager.PingConfig.default
         
         XCTAssertEqual(config.count, 5)
         XCTAssertEqual(config.interval, 1.0)
@@ -39,7 +39,7 @@ final class PingManagerV2Tests: XCTestCase {
     }
     
     func testCustomConfiguration() throws {
-        let config = PingManagerV2.PingConfig(
+        let config = PingManager.PingConfig(
             count: 10,
             interval: 2.0,
             timeout: 10.0,
@@ -70,16 +70,16 @@ final class PingManagerV2Tests: XCTestCase {
         
         XCTAssertNotNil(task)
         
+        wait(for: [expectation], timeout: 10.0)
+        
         // Cancel the task to clean up
         task.cancel()
-        
-        wait(for: [expectation], timeout: 10.0)
     }
     
     func testPingOperationWithCustomConfig() throws {
         let expectation = XCTestExpectation(description: "Ping with custom config")
         
-        let config = PingManagerV2.PingConfig(
+        let config = PingManager.PingConfig(
             count: 3,
             interval: 0.5,
             timeout: 3.0,
@@ -100,10 +100,10 @@ final class PingManagerV2Tests: XCTestCase {
         
         XCTAssertNotNil(task)
         
+        wait(for: [expectation], timeout: 10.0)
+        
         // Cancel the task to clean up
         task.cancel()
-        
-        wait(for: [expectation], timeout: 10.0)
     }
     
     func testPingOperationCancellation() throws {
@@ -129,7 +129,7 @@ final class PingManagerV2Tests: XCTestCase {
     func testPingStopMethod() throws {
         let expectation = XCTestExpectation(description: "Ping stopped")
         
-        let task = pingManager.performPing(
+        _ = pingManager.performPing(
             to: "127.0.0.1",
             onResult: { result in
                 // Should not be called after stop
@@ -219,7 +219,7 @@ final class PingManagerV2Tests: XCTestCase {
         
         var resultCount = 0
         
-        let config = PingManagerV2.PingConfig(
+        let config = PingManager.PingConfig(
             count: 3,
             interval: 1.0,
             timeout: 5.0,
@@ -249,12 +249,12 @@ final class PingManagerV2Tests: XCTestCase {
     
     func testPingManagerPerformance() throws {
         measure {
-            let manager = PingManagerV2()
+            let manager = PingManager()
             let expectation = XCTestExpectation(description: "Performance test")
             
             let task = manager.performPing(
                 to: "127.0.0.1",
-                config: PingManagerV2.PingConfig(count: 1, interval: 0.1, timeout: 1.0, payloadSize: 56),
+                config: PingManager.PingConfig(count: 1, interval: 0.1, timeout: 1.0, payloadSize: 56),
                 onResult: { _ in },
                 onComplete: { expectation.fulfill() }
             )
@@ -266,16 +266,16 @@ final class PingManagerV2Tests: XCTestCase {
     
     func testMultiplePingManagers() throws {
         measure {
-            var managers: [PingManagerV2] = []
+            var managers: [PingManager] = []
             var tasks: [Task<Void, Never>] = []
             
             for _ in 0..<5 {
-                let manager = PingManagerV2()
+                let manager = PingManager()
                 managers.append(manager)
                 
                 let task = manager.performPing(
                     to: "127.0.0.1",
-                    config: PingManagerV2.PingConfig(count: 1, interval: 0.1, timeout: 1.0, payloadSize: 56),
+                    config: PingManager.PingConfig(count: 1, interval: 0.1, timeout: 1.0, payloadSize: 56),
                     onResult: { _ in },
                     onComplete: { }
                 )
@@ -297,7 +297,7 @@ final class PingManagerV2Tests: XCTestCase {
     func testPingWithZeroCount() throws {
         let expectation = XCTestExpectation(description: "Zero count ping")
         
-        let config = PingManagerV2.PingConfig(
+        let config = PingManager.PingConfig(
             count: 0,
             interval: 1.0,
             timeout: 5.0,
@@ -323,7 +323,7 @@ final class PingManagerV2Tests: XCTestCase {
     func testPingWithVeryShortTimeout() throws {
         let expectation = XCTestExpectation(description: "Short timeout ping")
         
-        let config = PingManagerV2.PingConfig(
+        let config = PingManager.PingConfig(
             count: 1,
             interval: 1.0,
             timeout: 0.1,
@@ -331,7 +331,7 @@ final class PingManagerV2Tests: XCTestCase {
         )
         
         let task = pingManager.performPing(
-            to: "8.8.8.8",
+            to: "192.0.2.1", // RFC 5737 TEST-NET-1, never answers
             config: config,
             onResult: { result in
                 XCTAssertFalse(result.success)

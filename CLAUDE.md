@@ -9,35 +9,34 @@ NETo (Network Engineer Tools) – multiplatform SwiftUI app for iPhone, iPad and
 Run from this directory. Single scheme `neto`; targets `neto`, `netoTests`, `netoUITests`. The `/verify` skill (workspace root) runs the full check.
 
 ```bash
-# iOS / iPadOS simulators – builds work without overrides
+# iOS / iPadOS simulators – no overrides; disable parallel testing (see below)
 xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=iOS Simulator,name=iPhone 17' build
-xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M5)' build
+xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M5)' -parallel-testing-enabled NO test -only-testing:netoTests
 
-# macOS – needs the build-setting overrides shown (see "Project quirks")
-xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= MACOSX_DEPLOYMENT_TARGET=14.0
-xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoTests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= MACOSX_DEPLOYMENT_TARGET=14.0
-xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoUITests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= MACOSX_DEPLOYMENT_TARGET=14.0   # ~4 min
+# macOS – needs the signing overrides shown (see "Project quirks")
+xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
+xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoTests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
+xcodebuild -project neto.xcodeproj -scheme neto -destination 'platform=macOS,arch=arm64' test -only-testing:netoUITests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=   # ~4 min
 
 # Single test: XCTest method vs. Swift Testing function (note the parentheses)
 xcodebuild ... test -only-testing:netoTests/SimplePingTests/testSimplePingInitialization
 xcodebuild ... test -only-testing:'netoTests/netoTests/networkToolCaseCount()'
 ```
 
-Running tests on iOS simulators currently fails: the test host app `pl.lab22.neto` is refused at launch (`Launch failed`, cause not yet investigated). Until that is fixed, run tests on macOS and only build for the simulators.
+On simulators always pass `-parallel-testing-enabled NO`: with parallel testing, xcodebuild spawns simulator clones whose app launch fails (`RequestDenied` / `Launch failed`), adding log noise and up to 10 minutes of diagnostics timeout, even though the tests themselves run on one clone. Before a simulator test run, uninstall stale builds (`xcrun simctl uninstall <udid> pl.lab22.neto` and `pl.lab22.netoUITests.xctrunner`); otherwise launches regularly fail with `Busy ("Application failed preflight checks")`.
 
 Simulator names depend on the installed runtime – check `xcrun simctl list devices available`. Per project convention, verify changes on macOS, an iPhone simulator and an iPad Pro 11-inch simulator.
 
-The unit test suite is not green (several WHOIS, ping and stale assertions fail), and many tests hit the real network (ICMP to 127.0.0.1 / 8.8.8.8, live WHOIS servers). Known failures are listed in `../.claude/test-baseline.md` (workspace root); compare against it instead of assuming that every failure is new.
+The unit test suite is not green yet (WHOIS and stale assertions fail), and many tests hit the real network (ICMP to 127.0.0.1 / 8.8.8.8, live WHOIS servers). Known failures are listed in `../.claude/test-baseline.md` (workspace root); compare against it instead of assuming that every failure is new.
 
 No linter or formatter is configured. All three targets use Xcode file-system synchronized groups: new files in `neto/`, `netoTests/` or `netoUITests/` are picked up without editing `project.pbxproj`.
 
 ## Project quirks
 
 - macOS signing: the app target has `DEVELOPMENT_TEAM = RR748D7U66` with automatic signing. Without a "Mac Development" certificate for that team in the keychain, macOS builds fail (exit 65) unless ad-hoc signing is forced via the overrides above. Simulator builds are unaffected.
-- `MACOSX_DEPLOYMENT_TARGET = 14.0` is set only on the app target. The test targets inherit the SDK default, so macOS tests refuse to run on an older host OS without the override.
 - `IPHONEOS_DEPLOYMENT_TARGET = 17.0`, `SWIFT_VERSION = 5.0`, device family iPhone + iPad, no visionOS/tvOS/watchOS. Do not lower the deployment targets or add platforms unless asked.
 - There is no Info.plist file (`GENERATE_INFOPLIST_FILE = YES`, `INFOPLIST_KEY_*` build settings), and there are no `NS*UsageDescription` keys yet.
-- `neto/neto.entitlements` (App Sandbox, network client + server, user-selected read-only files) is applied to the app target on all platforms.
+- `neto/neto.entitlements` (App Sandbox, network client + server, user-selected read-only files) is applied to the app target on all platforms. ICMP inside the macOS sandbox needs **both** `network.client` and `network.server` (verified: without `server` the replies are blocked with EPERM), so do not drop either.
 - SwiftData is **not** used, despite older docs/README claiming it. There is no persistence.
 
 ## Architecture
@@ -46,8 +45,7 @@ No linter or formatter is configured. All three targets use Xcode file-system sy
 - Every tool is split into four files: `XxxView` (owns the view model via `@StateObject`) → `XxxViewModel` (`@MainActor final class`, `ObservableObject`, `@Published` state, keeps the running `Task` for cancellation) → `XxxManager` (networking, no UI) → `XxxResult` (value type).
 - Managers expose `performXxx(to:..., onResult:, onComplete:) -> Task<Void, Never>`: results stream back through callbacks, and the view model cancels the returned task on stop. ARP is the exception (`async throws -> ArpResult`).
 - Per tool:
-  - **Ping (shipped)** – `PingView` → `PingViewModel` → `PingManager`: not ICMP; it opens a UDP `NWConnection` to port 80 as a reachability probe.
-  - **Ping V2 (not wired in)** – `SimplePing` (Swift port of Apple's SimplePing: unprivileged `SOCK_DGRAM`/`IPPROTO_ICMP` socket, delegate-based) + `PingManagerV2` (`PingConfig`: count/interval/timeout/payloadSize) + `PingViewModelV2`/`PingViewV2`. Only tests reference it. `PING_REFACTORING.md` describes the intended migration; its `NETO_DEBUG_PING` env var is not implemented. Swapping `PingView` for `PingViewV2` will break UI tests that match the texts "Ping Tool" / "Send 5 Ping Packets".
+  - **Ping** – `PingView` → `PingViewModel` → `PingManager` → `SimplePing` (Swift port of Apple's SimplePing): unprivileged `SOCK_DGRAM` ICMP socket (`IPPROTO_ICMP` / `IPPROTO_ICMPV6`), read through a `DispatchSource` on the main queue. On IPv4 the kernel hands back the IP header in front of the ICMP reply, so it has to be skipped. Identifier and sequence number travel in big-endian order. `PingManager` keeps all state on the main actor, calls `onComplete` exactly once (also after cancellation) and serializes runs. Verified on macOS and the iOS Simulator; not yet verified on a physical iOS device.
   - **Traceroute** – TCP `NWConnection` probes with per-hop timeouts, not a TTL-based traceroute.
   - **WHOIS** – raw TCP port 43 via `NWConnection`, intended as a port of FreeBSD `whois.c` (server constants, suffix→server table, referral prefixes and RIR loop detection are marked "exact match" in comments). Keep it consistent with the reference sources in `Temporary Items/` (`whois.c`, `rfc3912.txt`; untracked, local only) rather than inventing new logic.
   - **ARP** – macOS reads the neighbor cache via `sysctl()` on the routing table; iOS/iPadOS can only list basic interface info.
