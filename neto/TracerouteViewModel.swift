@@ -28,8 +28,11 @@ final class TracerouteViewModel: ObservableObject {
     private var tracerouteTask: Task<Void, Never>?
     /// Identifies the current run, so late callbacks of a stopped run cannot touch a newer one
     private var currentRunID: UUID?
-    /// The "stopped by user" row is not a hop and does not count for progress
-    private var stopRowID: UUID?
+    /// Parameters of the current or last run, so the export does not pick up later edits of the form
+    private(set) var runParameters: (host: String, maxHops: Int, timeout: Double)?
+    
+    /// The last run was stopped by the user (shown as a status, not as a hop)
+    @Published private(set) var stoppedByUser = false
     
     // MARK: - Public Methods
     
@@ -62,7 +65,8 @@ final class TracerouteViewModel: ObservableObject {
         isTracing = true
         errorMessage = nil
         tracerouteResults.removeAll()
-        stopRowID = nil
+        stoppedByUser = false
+        runParameters = (host, maxHops, timeout)
         let runID = UUID()
         currentRunID = runID
         
@@ -75,32 +79,21 @@ final class TracerouteViewModel: ObservableObject {
                 guard self?.currentRunID == runID else { return }
                 self?.handleTracerouteResult(result)
             },
-            onComplete: { [weak self] in
+            onComplete: { [weak self] error in
                 guard self?.currentRunID == runID else { return }
-                self?.handleTracerouteComplete()
+                self?.handleTracerouteComplete(error: error)
             }
         )
     }
     
-    /// Stops the current traceroute operation
+    /// Stops the current traceroute operation; the results so far stay, marked as stopped
     func stopTraceroute() {
+        guard isTracing else { return }
         tracerouteTask?.cancel()
         tracerouteTask = nil
         currentRunID = nil
         isTracing = false
-        
-        // Add a final result to show the traceroute was stopped
-        if !tracerouteResults.isEmpty {
-            let result = TracerouteResult(
-                hopNumber: currentHop + 1,
-                success: false,
-                responseTime: 0,
-                message: "Traceroute stopped by user",
-                isDestination: false
-            )
-            stopRowID = result.id
-            tracerouteResults.append(result)
-        }
+        stoppedByUser = true
     }
     
     /// Checks if the target host input is valid
@@ -125,7 +118,7 @@ final class TracerouteViewModel: ObservableObject {
     
     /// Gets the current hop count
     var currentHop: Int {
-        tracerouteResults.filter { $0.id != stopRowID }.map(\.hopNumber).max() ?? 0
+        tracerouteResults.map(\.hopNumber).max() ?? 0
     }
     
     /// Checks if the destination has been reached
@@ -146,10 +139,11 @@ final class TracerouteViewModel: ObservableObject {
         }
     }
     
-    /// Handles completion of all traceroute operations
-    private func handleTracerouteComplete() {
+    /// Handles the end of the run; an error (resolution, socket or send failure) is shown to the user (internal for tests)
+    func handleTracerouteComplete(error: Error?) {
         isTracing = false
         tracerouteTask = nil
+        if let error { errorMessage = error.localizedDescription }
     }
     
     /// Clears all results and resets state
@@ -159,43 +153,40 @@ final class TracerouteViewModel: ObservableObject {
         currentRunID = nil
         tracerouteResults.removeAll()
         errorMessage = nil
+        stoppedByUser = false
     }
     
-    /// Exports traceroute results as a formatted string
+    /// Formats the results of the current or last run as text, one traceroute-style line per hop
     func exportResults() -> String {
-        let host = targetHost.trimmingCharacters(in: .whitespacesAndNewlines)
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .short)
+        let parameters = runParameters ?? (targetHost.trimmingCharacters(in: .whitespacesAndNewlines), maxHops, timeout)
         
         var output = "NETo Traceroute Results\n"
-        output += "Target: \(host)\n"
+        output += "Target: \(parameters.host)\n"
         output += "Date: \(timestamp)\n"
-        output += "Max Hops: \(maxHops)\n"
-        output += "Timeout: \(timeout)s\n"
+        output += "Max Hops: \(parameters.maxHops)\n"
+        output += "Probe Timeout: \(parameters.timeout)s\n"
         output += String(repeating: "-", count: 50) + "\n\n"
         
         if tracerouteResults.isEmpty {
             output += "No results available.\n"
         } else {
             for result in tracerouteResults {
-                if !result.probeTimes.isEmpty {
-                    output += String(format: "%2d. %@  %@\n",
-                                   result.hopNumber,
-                                   result.message,
-                                   result.formattedProbeTimes)
-                } else {
-                    output += String(format: "%2d. %@\n", 
-                                   result.hopNumber, 
-                                   result.message)
-                }
+                output += String(format: "%2d  ", result.hopNumber) + result.line + "\n"
             }
             
             if destinationReached {
                 output += "\nTrace complete.\n"
             } else if isTracing {
                 output += "\nTrace in progress...\n"
+            } else if stoppedByUser {
+                output += "\nTrace stopped by user.\n"
             } else {
                 output += "\nTrace incomplete.\n"
             }
+        }
+        if let errorMessage {
+            output += "Error: \(errorMessage)\n"
         }
         
         return output

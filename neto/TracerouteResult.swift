@@ -37,8 +37,8 @@ struct TracerouteResult: Identifiable {
     /// Round-trip time of each probe sent to this hop in milliseconds, nil for a probe without reply
     let probeTimes: [Double?]
     
-    /// ICMP Destination Unreachable code that ended the trace at this hop, if any
-    let unreachableCode: UInt8?
+    /// traceroute annotation printed after each probe's time (e.g. "!H" for host unreachable), nil for none
+    let probeAnnotations: [String?]
     
     /// Address that answered each probe (nil = no reply); differs between probes when paths are load-balanced (ECMP)
     let probeAddresses: [String?]
@@ -53,7 +53,7 @@ struct TracerouteResult: Identifiable {
         message: String,
         isDestination: Bool = false,
         probeTimes: [Double?] = [],
-        unreachableCode: UInt8? = nil,
+        probeAnnotations: [String?] = [],
         probeAddresses: [String?] = []
     ) {
         self.id = id
@@ -65,23 +65,37 @@ struct TracerouteResult: Identifiable {
         self.message = message
         self.isDestination = isDestination
         self.probeTimes = probeTimes
-        self.unreachableCode = unreachableCode
+        self.probeAnnotations = probeAnnotations
         self.probeAddresses = probeAddresses
     }
     
-    /// Probe times as shown by traceroute, e.g. "1.23 ms  4.56 ms  *". When a probe was answered by another
-    /// address than the previous answer (load-balanced paths), that address is shown before its time.
+    /// Probe columns as printed by traceroute, in probe order: "1.234 ms  4.567 ms *" or "* * *". When a probe was
+    /// answered by another address than the previous answer (load-balanced paths), that address precedes its time.
     var formattedProbeTimes: String {
         var shownAddress = ipAddress
-        return probeTimes.enumerated().map { index, time in
-            guard let time else { return "*" }
-            let address = index < probeAddresses.count ? probeAddresses[index] : nil
-            var text = String(format: "%.2f ms", time)
-            if let address, address != shownAddress {
-                text = "(\(address)) " + text
+        var text = ""
+        for (index, time) in probeTimes.enumerated() {
+            guard let time else {
+                text += " *"
+                continue
+            }
+            text += "  "
+            if index < probeAddresses.count, let address = probeAddresses[index], address != shownAddress {
+                text += "(\(address)) "
                 shownAddress = address
             }
-            return text
-        }.joined(separator: "  ")
+            text += String(format: "%.3f ms", time)
+            if index < probeAnnotations.count, let annotation = probeAnnotations[index] {
+                text += " " + annotation
+            }
+        }
+        return String(text.drop { $0 == " " })
     }
-} 
+
+    /// The hop as one traceroute line without the hop number: router, then the probe columns
+    var line: String {
+        let probes = formattedProbeTimes
+        if message.isEmpty { return probes }
+        return probes.isEmpty ? message : message + "  " + probes
+    }
+}

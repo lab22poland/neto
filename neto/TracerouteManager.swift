@@ -35,9 +35,13 @@ final class TracerouteManager {
     private var family: Int32 = AF_INET
     private var identifier: UInt16 = 0
     private var nextSequenceNumber: UInt16 = 0
-    /// Send time per sequence number on the monotonic clock (DispatchTime nanoseconds)
-    private var sendTimes: [UInt16: UInt64] = [:]
-    private var replies: [UInt16: (time: Double, address: String, reply: ICMPPacket.ProbeReply)] = [:]
+    /// The probe in flight and its send time on the monotonic clock (DispatchTime nanoseconds). Like traceroute,
+    /// only a reply to this probe counts; a late reply to an earlier probe is ignored.
+    private var awaitedProbe: (sequenceNumber: UInt16, sentAt: UInt64)?
+    private var awaitedReply: ProbeAnswer?
+    /// Answers per hop row of the current run, so a router name that arrives later can re-deliver the latest row
+    private var hops: [UUID: (hopNumber: Int, probes: [ProbeAnswer?])] = [:]
+    private var hostnames: [UUID: String] = [:]
     private var runTask: Task<Void, Never>?
     /// Incremented per socket, so replies read from a closed socket cannot reach a newer run
     private var socketGeneration = 0
@@ -45,6 +49,25 @@ final class TracerouteManager {
     private let readQueue = DispatchQueue(label: "pl.lab22.neto.traceroute.read", qos: .userInitiated)
     /// Set when receiving fails hard (e.g. EPERM in the sandbox); ends the run
     private var socketError: Error?
+
+    /// The reply to one probe
+    struct ProbeAnswer: Equatable {
+        /// Round-trip time in milliseconds
+        let time: Double
+        /// Address that answered
+        let address: String
+        let reply: ICMPPacket.ProbeReply
+    }
+
+    /// What one reply means for its hop, as decided by traceroute.c (IPv4) and traceroute6.c (IPv6)
+    struct ProbeVerdict: Equatable {
+        /// Printed after the probe's time, e.g. "!H"
+        let annotation: String?
+        /// The probe got to the target ("got_there")
+        let reachedTarget: Bool
+        /// Counts towards giving up on an unreachable path
+        let unreachable: Bool
+    }
 
     deinit {
         // Close the socket if the manager goes away during a run
@@ -57,9 +80,11 @@ final class TracerouteManager {
     /// - Parameters:
     ///   - host: The target host (IP address or domain name)
     ///   - maxHops: Maximum TTL / hop limit to probe
-    ///   - timeout: Seconds to wait for the replies of one hop
-    ///   - onResult: Called on the main actor with one result per hop; called again with the same `id` when the router's name is resolved
-    ///   - onComplete: Called exactly once when the run ends, including after cancellation
+    ///   - timeout: Seconds to wait for the reply to each probe (traceroute `-w`, default 5); probes go out one after another
+    ///   - onResult: Called on the main actor after every probe with the hop's row so far; the same row (same `id`)
+    ///     comes again with the next probe and when the router's name is resolved, even after the run has ended
+    ///   - onComplete: Called exactly once when the run ends, including after cancellation; carries the error that
+    ///     ended the run (resolution, socket or send failure), nil when it finished or was cancelled
     /// - Returns: A Task that can be cancelled
     @MainActor
     func performTraceroute(
@@ -67,19 +92,19 @@ final class TracerouteManager {
         maxHops: Int = 30,
         timeout: TimeInterval = 5.0,
         onResult: @escaping (TracerouteResult) -> Void,
-        onComplete: @escaping () -> Void
+        onComplete: @escaping (Error?) -> Void
     ) -> Task<Void, Never> {
         // Runs share the socket state, so a new run waits until the previous (cancelled) one has finished.
         let previousTask = runTask
         previousTask?.cancel()
         let task = Task { @MainActor [weak self] in
             await previousTask?.value
-            guard let self else { onComplete(); return }
-            await self.trace(host: host, maxHops: maxHops, timeout: timeout) { result in
+            guard let self else { onComplete(nil); return }
+            let error = await self.trace(host: host, maxHops: maxHops, timeout: timeout) { result in
                 if !Task.isCancelled { onResult(result) }
             }
             self.closeSocket()
-            onComplete()
+            onComplete(Task.isCancelled ? nil : error)
         }
         runTask = task
         return task
@@ -159,14 +184,8 @@ final class TracerouteManager {
         return predicate.evaluate(with: hostname) && hostname.count <= 253
     }
 
-    /// Formats the hop message for display
-    func formatHopMessage(
-        ipAddress: String?,
-        hostname: String?,
-        isDestination: Bool,
-        unreachableCode: UInt8? = nil,
-        family: Int32 = AF_INET
-    ) -> String {
+    /// Formats the router part of a hop row; empty when no probe was answered (the probe columns show "*")
+    func formatHopMessage(ipAddress: String?, hostname: String?, isDestination: Bool) -> String {
         var components: [String] = []
 
         if let hostname = hostname, hostname != ipAddress {
@@ -177,11 +196,7 @@ final class TracerouteManager {
             components.append("(\(ipAddress))")
         }
 
-        var hostInfo = components.isEmpty ? "* * *" : components.joined(separator: " ")
-        if let unreachableCode {
-            hostInfo += " " + Self.unreachableAnnotation(code: unreachableCode, family: family)
-        }
-
+        let hostInfo = components.joined(separator: " ")
         if isDestination {
             return "\(hostInfo) [DESTINATION REACHED]"
         } else {
@@ -191,128 +206,167 @@ final class TracerouteManager {
 
     // MARK: - Tracing
 
+    /// Runs the trace like traceroute's main loop: per hop, probes go out one after another and each waits for its
+    /// own reply or the timeout. Returns the error that ended the run, nil when it finished or was cancelled.
     @MainActor
-    private func trace(host: String, maxHops: Int, timeout: TimeInterval, deliver: @escaping (TracerouteResult) -> Void) async {
-        guard maxHops >= 1 else { return }
+    private func trace(host: String, maxHops: Int, timeout: TimeInterval, deliver: @escaping (TracerouteResult) -> Void) async -> Error? {
+        guard maxHops >= 1 else { return nil }
         let target: ResolvedHost
         do {
             target = try await resolveHost(host)
         } catch {
-            if !Task.isCancelled {
-                deliver(TracerouteResult(hopNumber: 1, success: false, responseTime: 0,
-                                         message: "Failed to resolve host: \(host) - \(error.localizedDescription)"))
-            }
-            return
+            return Task.isCancelled ? nil : error
         }
-        if Task.isCancelled { return }
+        if Task.isCancelled { return nil }
 
-        for hop in 1...maxHops {
-            if Task.isCancelled { return }
-            let sequenceNumbers: [UInt16]
-            do {
-                if hop == 1 { try openSocket(family: target.family) }
-                sequenceNumbers = try sendProbes(to: target, hopLimit: hop)
-                await waitForReplies(to: sequenceNumbers, timeout: timeout)
-                if let socketError { throw socketError }
-            } catch {
-                if !Task.isCancelled {
-                    deliver(TracerouteResult(hopNumber: hop, success: false, responseTime: 0,
-                                             message: "Traceroute failed: \(error.localizedDescription)"))
+        do {
+            try openSocket(family: target.family)
+            for hop in 1...maxHops {
+                try setHopLimit(hop)
+                let id = UUID()
+                var probes: [ProbeAnswer?] = []
+                for _ in 0..<Self.probesPerHop {
+                    if Task.isCancelled { return nil }
+                    let sequenceNumber = try sendProbe(to: target, hop: hop)
+                    await waitForReply(to: sequenceNumber, timeout: timeout)
+                    if let socketError { throw socketError }
+                    if Task.isCancelled { return nil }
+                    let answer = awaitedReply
+                    awaitedProbe = nil
+                    probes.append(answer)
+                    hops[id] = (hop, probes)
+                    // Like traceroute, the router's name is looked up for the first address that answers
+                    if let answer, probes.compactMap({ $0 }).count == 1 {
+                        resolveName(of: id, address: answer.address, deliver: deliver)
+                    }
+                    deliver(makeResult(id: id))
                 }
-                return
+                let verdicts = probes.compactMap { $0.map { Self.verdict(for: $0.reply, family: family) } }
+                if Self.endsTrace(verdicts, family: family) { return nil }
             }
-            if Task.isCancelled { return }
-
-            let answered = sequenceNumbers.compactMap { replies[$0] }
-            let routerAddress = answered.first?.address
-            let reachedTarget = answered.contains { reply in
-                if case .echoReply = reply.reply { return true }
-                if case .destinationUnreachable = reply.reply { return reply.address == target.ipAddress }
-                return false
-            }
-            let unreachableCode = answered.lazy.compactMap { reply -> UInt8? in
-                if case .destinationUnreachable(_, let code) = reply.reply { return code } else { return nil }
-            }.first
-            let probeTimes: [Double?] = sequenceNumbers.map { replies[$0]?.time }
-            let probeAddresses: [String?] = sequenceNumbers.map { replies[$0]?.address }
-            let times = probeTimes.compactMap { $0 }
-            let result = TracerouteResult(
-                hopNumber: hop,
-                success: !answered.isEmpty,
-                ipAddress: routerAddress,
-                responseTime: times.isEmpty ? 0 : times.reduce(0, +) / Double(times.count),
-                message: formatHopMessage(ipAddress: routerAddress, hostname: nil, isDestination: reachedTarget,
-                                          unreachableCode: unreachableCode, family: family),
-                isDestination: reachedTarget,
-                probeTimes: probeTimes,
-                unreachableCode: unreachableCode,
-                probeAddresses: probeAddresses
-            )
-            deliver(result)
-            if let routerAddress {
-                resolveName(of: result, address: routerAddress, deliver: deliver)
-            }
-            // The path ends at the target, or where a router reports the target unreachable
-            if reachedTarget || unreachableCode != nil { return }
+            return nil
+        } catch {
+            return Task.isCancelled ? nil : error
         }
     }
 
-    /// Sends the probes of one hop and returns their sequence numbers
+    /// Builds the row of a hop from its answers so far and the router's name, if already known
     @MainActor
-    private func sendProbes(to target: ResolvedHost, hopLimit: Int) throws -> [UInt16] {
-        var limit = Int32(hopLimit)
+    private func makeResult(id: UUID) -> TracerouteResult {
+        let (hopNumber, probes) = hops[id] ?? (0, [])
+        let answered = probes.compactMap { $0 }
+        let verdicts = probes.map { $0.map { Self.verdict(for: $0.reply, family: family) } }
+        let routerAddress = answered.first?.address
+        let reachedTarget = verdicts.contains { $0?.reachedTarget == true }
+        let hostname = hostnames[id]
+        let times = answered.map(\.time)
+        return TracerouteResult(
+            id: id,
+            hopNumber: hopNumber,
+            success: !answered.isEmpty,
+            ipAddress: routerAddress,
+            hostname: hostname,
+            responseTime: times.isEmpty ? 0 : times.reduce(0, +) / Double(times.count),
+            message: formatHopMessage(ipAddress: routerAddress, hostname: hostname, isDestination: reachedTarget),
+            isDestination: reachedTarget,
+            probeTimes: probes.map { $0?.time },
+            probeAnnotations: verdicts.map { $0?.annotation },
+            probeAddresses: probes.map { $0?.address }
+        )
+    }
+
+    /// Classifies a probe reply like traceroute's `packet_ok` switch (IPv4) or traceroute6 (IPv6)
+    static func verdict(for reply: ICMPPacket.ProbeReply, family: Int32) -> ProbeVerdict {
+        switch reply {
+        case .timeExceeded:
+            return ProbeVerdict(annotation: nil, reachedTarget: false, unreachable: false)
+        case .echoReply:
+            return ProbeVerdict(annotation: nil, reachedTarget: true, unreachable: false)
+        case .destinationUnreachable(_, let code):
+            if family == AF_INET6 {
+                // RFC 4443 codes as printed by traceroute6; port unreachable means the target was reached,
+                // other codes are neither printed nor counted
+                switch code {
+                case 0: return ProbeVerdict(annotation: "!N", reachedTarget: false, unreachable: true)
+                case 1: return ProbeVerdict(annotation: "!P", reachedTarget: false, unreachable: true)
+                case 2: return ProbeVerdict(annotation: "!S", reachedTarget: false, unreachable: true)
+                case 3: return ProbeVerdict(annotation: "!A", reachedTarget: false, unreachable: true)
+                case 4: return ProbeVerdict(annotation: nil, reachedTarget: true, unreachable: false)
+                default: return ProbeVerdict(annotation: nil, reachedTarget: false, unreachable: false)
+                }
+            }
+            switch code {
+            case 3: return ProbeVerdict(annotation: nil, reachedTarget: true, unreachable: false)
+            case 2: return ProbeVerdict(annotation: "!P", reachedTarget: true, unreachable: false)
+            default: return ProbeVerdict(annotation: unreachableAnnotation(code: code), reachedTarget: false, unreachable: true)
+            }
+        }
+    }
+
+    /// traceroute stops after the hop that got to the target, or when most probes of the hop came back unreachable:
+    /// at least nprobes - 1 (traceroute.c) or (nprobes + 1) / 2 (traceroute6.c), which is 2 of 3 for both
+    static func endsTrace(_ verdicts: [ProbeVerdict], family: Int32) -> Bool {
+        if verdicts.contains(where: \.reachedTarget) { return true }
+        let unreachable = verdicts.filter(\.unreachable).count
+        let limit = family == AF_INET6 ? (probesPerHop + 1) / 2 : probesPerHop - 1
+        return unreachable > 0 && unreachable >= limit
+    }
+
+    /// Sets the TTL / hop limit of the following probes
+    @MainActor
+    private func setHopLimit(_ hop: Int) throws {
+        var limit = Int32(hop)
         let status = family == AF_INET6
             ? setsockopt(socketFD, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &limit, socklen_t(MemoryLayout<Int32>.size))
             : setsockopt(socketFD, IPPROTO_IP, IP_TTL, &limit, socklen_t(MemoryLayout<Int32>.size))
         // Without the hop limit the probes would reach the target and hop 1 would look like the destination
         guard status == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        var sent: [UInt16] = []
-        for _ in 0..<Self.probesPerHop {
-            let sequenceNumber = nextSequenceNumber
-            nextSequenceNumber &+= 1
-            let packet = ICMPPacket.echoRequest(family: family, identifier: identifier, sequenceNumber: sequenceNumber, payload: Data(repeating: 0x4E, count: 24))
-            sendTimes[sequenceNumber] = DispatchTime.now().uptimeNanoseconds
-            _ = packet.withUnsafeBytes { bytes in
-                target.address.withUnsafeBytes { address in
-                    sendto(socketFD, bytes.baseAddress, bytes.count, 0,
-                           address.bindMemory(to: sockaddr.self).baseAddress, socklen_t(target.address.count))
-                }
+    }
+
+    /// Sends one echo probe and returns its sequence number. A failed send (e.g. "Socket is not connected" for
+    /// 0.0.0.0) throws: traceroute prints the error and keeps waiting out every probe, the app reports it and stops.
+    @MainActor
+    private func sendProbe(to target: ResolvedHost, hop: Int) throws -> UInt16 {
+        let sequenceNumber = nextSequenceNumber
+        nextSequenceNumber &+= 1
+        let packet = ICMPPacket.echoRequest(family: family, identifier: identifier, sequenceNumber: sequenceNumber, payload: Data(repeating: 0x4E, count: 24))
+        awaitedReply = nil
+        awaitedProbe = (sequenceNumber, DispatchTime.now().uptimeNanoseconds)
+        let sent = packet.withUnsafeBytes { bytes in
+            target.address.withUnsafeBytes { address in
+                sendto(socketFD, bytes.baseAddress, bytes.count, 0,
+                       address.bindMemory(to: sockaddr.self).baseAddress, socklen_t(target.address.count))
             }
-            // A failed send simply stays unanswered and shows as "*"
-            sent.append(sequenceNumber)
         }
-        return sent
+        guard sent == packet.count else {
+            let reason = sent < 0 ? String(cString: strerror(errno)) : "wrote \(sent) of \(packet.count) bytes"
+            awaitedProbe = nil
+            throw TracerouteError.sendFailed(hop: hop, reason: reason)
+        }
+        return sequenceNumber
     }
 
+    /// Waits until the probe is answered or `timeout` seconds after it was sent (traceroute's `wait_for_reply`)
     @MainActor
-    private func waitForReplies(to sequenceNumbers: [UInt16], timeout: TimeInterval) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !Task.isCancelled, Date() < deadline, sequenceNumbers.contains(where: { replies[$0] == nil }) {
-            try? await Task.sleep(nanoseconds: 10_000_000)
+    private func waitForReply(to sequenceNumber: UInt16, timeout: TimeInterval) async {
+        guard let sentAt = awaitedProbe?.sentAt else { return }
+        let deadline = sentAt + UInt64(timeout * 1_000_000_000)
+        while !Task.isCancelled, socketError == nil, awaitedReply == nil, DispatchTime.now().uptimeNanoseconds < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
 
-    /// Looks up the router's name in the background and re-delivers the row with it (ignored if it arrives too late)
+    /// Looks up the router's name in the background and re-delivers the hop's latest row with it. There is no
+    /// time limit (traceroute resolves synchronously); a name that arrives after the run is still delivered.
     @MainActor
-    private func resolveName(of result: TracerouteResult, address: String, deliver: @escaping (TracerouteResult) -> Void) {
-        let family = self.family
+    private func resolveName(of id: UUID, address: String, deliver: @escaping (TracerouteResult) -> Void) {
+        let generation = socketGeneration
         Task { @MainActor in
-            let lookedUp = (try? await Self.runBlocking(timeout: 2) { Self.reverseLookup(address) }) ?? nil
-            guard let name = lookedUp, name != address else { return }
-            deliver(TracerouteResult(
-                id: result.id,
-                hopNumber: result.hopNumber,
-                success: result.success,
-                ipAddress: result.ipAddress,
-                hostname: name,
-                responseTime: result.responseTime,
-                message: formatHopMessage(ipAddress: address, hostname: name, isDestination: result.isDestination,
-                                          unreachableCode: result.unreachableCode, family: family),
-                isDestination: result.isDestination,
-                probeTimes: result.probeTimes,
-                unreachableCode: result.unreachableCode,
-                probeAddresses: result.probeAddresses
-            ))
+            let lookedUp = (try? await Self.runBlocking { Self.reverseLookup(address) }) ?? nil
+            guard let name = lookedUp, name != address,
+                  generation == self.socketGeneration, self.hops[id] != nil else { return }
+            self.hostnames[id] = name
+            deliver(self.makeResult(id: id))
         }
     }
 
@@ -323,8 +377,10 @@ final class TracerouteManager {
         closeSocket()
         self.family = family
         identifier = UInt16.random(in: 1...UInt16.max)
-        sendTimes.removeAll()
-        replies.removeAll()
+        awaitedProbe = nil
+        awaitedReply = nil
+        hops.removeAll()
+        hostnames.removeAll()
         socketError = nil
 
         let fd = Darwin.socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
@@ -394,15 +450,15 @@ final class TracerouteManager {
         }
     }
 
-    /// Records replies of the current socket; the first reply per sequence number wins
+    /// Records the first reply to the probe in flight; replies to earlier probes are ignored like in traceroute
     @MainActor
     private func record(_ received: [ReceivedReply], error: Error?, generation: Int) {
         guard generation == socketGeneration else { return }
         for item in received {
-            guard let sent = sendTimes[item.reply.sequenceNumber],
-                  replies[item.reply.sequenceNumber] == nil,
-                  item.receivedAt >= sent else { continue }
-            replies[item.reply.sequenceNumber] = (Double(item.receivedAt - sent) / 1_000_000, item.address, item.reply)
+            guard let awaitedProbe, awaitedReply == nil,
+                  item.reply.sequenceNumber == awaitedProbe.sequenceNumber,
+                  item.receivedAt >= awaitedProbe.sentAt else { continue }
+            awaitedReply = ProbeAnswer(time: Double(item.receivedAt - awaitedProbe.sentAt) / 1_000_000, address: item.address, reply: item.reply)
         }
         if let error, socketError == nil {
             // Stop reading instead of spinning on the read source; the trace loop reports the error
@@ -411,24 +467,25 @@ final class TracerouteManager {
         }
     }
 
-    /// traceroute-style annotation of an ICMP Destination Unreachable code
-    static func unreachableAnnotation(code: UInt8, family: Int32) -> String {
-        if family == AF_INET6 {
-            // RFC 4443: 0 no route, 1 administratively prohibited, 3 address unreachable, 4 port unreachable
-            switch code {
-            case 0: return "!N"
-            case 1: return "!X"
-            case 3: return "!H"
-            case 4: return "!P"
-            default: return "!<\(code)>"
-            }
-        }
-        // RFC 792 / RFC 1812: 0 net, 1 host, 2 protocol, 3 port, 9/10/13 administratively prohibited
+    /// Annotation of an IPv4 Destination Unreachable code as printed by traceroute.c (RFC 792 / RFC 1812 codes;
+    /// traceroute adds the next-hop MTU to "!F", which the app does not read)
+    static func unreachableAnnotation(code: UInt8) -> String {
         switch code {
         case 0: return "!N"
         case 1: return "!H"
-        case 2, 3: return "!P"
-        case 9, 10, 13: return "!X"
+        case 2: return "!P"
+        case 4: return "!F"
+        case 5: return "!S"
+        case 6: return "!U"
+        case 7: return "!W"
+        case 8: return "!I"
+        case 9: return "!A"
+        case 10: return "!Z"
+        case 11: return "!Q"
+        case 12: return "!T"
+        case 13: return "!X"
+        case 14: return "!V"
+        case 15: return "!C"
         default: return "!<\(code)>"
         }
     }
@@ -518,6 +575,7 @@ private final class ResumeOnce<T>: @unchecked Sendable {
 enum TracerouteError: LocalizedError {
     case invalidHost(String)
     case resolutionFailed(String, String)
+    case sendFailed(hop: Int, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -525,6 +583,8 @@ enum TracerouteError: LocalizedError {
             return message
         case .resolutionFailed(let host, let reason):
             return "Cannot resolve \(host): \(reason)"
+        case .sendFailed(let hop, let reason):
+            return "Cannot send the probe for hop \(hop): sendto: \(reason)"
         }
     }
 }

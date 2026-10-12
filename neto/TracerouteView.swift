@@ -13,6 +13,8 @@ import UIKit
 
 struct TracerouteView: View {
     @StateObject private var viewModel = TracerouteViewModel()
+    /// Briefly confirms that the results were copied to the clipboard
+    @State private var copied = false
     
     var body: some View {
         // The whole tool scrolls, so the results list keeps its minimum height on small screens and windows
@@ -71,7 +73,7 @@ struct TracerouteView: View {
                 }
                 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Timeout (seconds)")
+                    Text("Timeout per probe (seconds)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     
@@ -140,11 +142,12 @@ struct TracerouteView: View {
                     }
                     .buttonStyle(.bordered)
                     
-                    Button(action: shareResults) {
-                        Text("Export")
+                    Button(action: copyResults) {
+                        Text(copied ? "Copied" : "Copy")
                             .frame(minWidth: 60, minHeight: 32)
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier("traceroute.copy")
                 }
             }
         }
@@ -192,6 +195,11 @@ struct TracerouteView: View {
                                 .font(.caption)
                                 .accessibilityIdentifier("traceroute.destination")
                         }
+                    } else if viewModel.stoppedByUser {
+                        Text("Stopped by user")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                            .accessibilityIdentifier("traceroute.stopped")
                     } else if viewModel.isTracing {
                         HStack {
                             ProgressView()
@@ -231,8 +239,10 @@ struct TracerouteView: View {
         }
     }
     
-    private func shareResults() {
+    private func copyResults() {
         let results = viewModel.exportResults()
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
         
         #if os(macOS)
         let pasteboard = NSPasteboard.general
@@ -256,12 +266,14 @@ struct TracerouteResultRow: View {
                 .frame(width: 20, alignment: .trailing)
             
             VStack(alignment: .leading, spacing: 2) {
-                // Main message
-                Text(result.message)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(result.success ? .primary : .secondary)
+                // Router; empty when no probe was answered
+                if !result.message.isEmpty {
+                    Text(result.message)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(result.success ? .primary : .secondary)
+                }
                 
-                // Round-trip time of each probe ("*" = no reply)
+                // Round-trip time of each probe in probe order ("*" = no reply)
                 if !result.probeTimes.isEmpty {
                     Text(result.formattedProbeTimes)
                         .font(.system(.caption2, design: .monospaced))
