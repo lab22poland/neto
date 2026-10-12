@@ -29,9 +29,10 @@ struct AboutView: View {
                         }
                     }
                     
-                    Text("Version 1.0")
+                    Text(Self.versionText(Bundle.main.infoDictionary))
                         .font(.subheadline)
                         .foregroundColor(.secondary)
+                        .accessibilityIdentifier("about.version")
                 }
                 
                 Divider()
@@ -152,7 +153,7 @@ struct AboutView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                     
-                    Text("sergii.solyanik@lab22.pl")
+                    Text("sergii.solianyk@lab22.pl")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     
@@ -166,6 +167,14 @@ struct AboutView: View {
             .padding()
         }
         .navigationTitle("About")
+    }
+
+    /// "Version 1.0 (1)" from the bundle's CFBundleShortVersionString and CFBundleVersion (MARKETING_VERSION and
+    /// CURRENT_PROJECT_VERSION); the build number is left out when it is missing or equal to the version
+    static func versionText(_ info: [String: Any]?) -> String {
+        guard let version = info?["CFBundleShortVersionString"] as? String, !version.isEmpty else { return "Version unknown" }
+        guard let build = info?["CFBundleVersion"] as? String, !build.isEmpty, build != version else { return "Version \(version)" }
+        return "Version \(version) (\(build))"
     }
 }
 

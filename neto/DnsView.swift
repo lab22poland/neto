@@ -182,9 +182,7 @@ struct DnsView: View {
                     recordsSection("Authority", message.authority)
                     recordsSection("Additional", message.additional)
 
-                    Text(String(format: "Query time: %.0f ms · %@ (%@) over %@ · %d bytes",
-                                result.queryTime, result.server.label, result.server.address,
-                                result.transport.rawValue, result.responseSize))
+                    Text(result.summary)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
