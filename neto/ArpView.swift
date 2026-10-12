@@ -278,7 +278,7 @@ struct ArpView: View {
             Image(systemName: "lock.fill")
                 .foregroundColor(.primary)
                 .font(.system(size: 10))
-        } else if entry.macAddress == "(incomplete)" || entry.status.contains("incomplete") || entry.status == "expired" {
+        } else if entry.macAddress == "(incomplete)" || entry.status.contains("incomplete") || entry.status.hasSuffix("expired") || entry.status == "unknown" {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.secondary)
                 .font(.system(size: 10))

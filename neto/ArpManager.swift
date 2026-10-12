@@ -25,7 +25,8 @@ final class ArpManager {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     #if os(macOS)
-                    let entries = try Self.readNeighborTable(family: AF_INET) + Self.readNeighborTable(family: AF_INET6)
+                    // IPv4 must work; a failing IPv6 dump only drops the IPv6 part
+                    let entries = try Self.readNeighborTable(family: AF_INET) + ((try? Self.readNeighborTable(family: AF_INET6)) ?? [])
                     #else
                     // On iOS/iPadOS, we can only get basic interface information
                     let entries = try Self.getBasicInterfaceEntries()
@@ -49,11 +50,15 @@ final class ArpManager {
             throw ArpError.systemCallFailed("sysctl size: \(String(cString: strerror(errno)))")
         }
         guard size > 0 else { return [] }
-        // The table can grow between the two calls
-        size += size / 8
-        var buffer = [UInt8](repeating: 0, count: size)
-        guard sysctl(&mib, UInt32(mib.count), &buffer, &size, nil, 0) == 0 else {
-            throw ArpError.systemCallFailed("sysctl dump: \(String(cString: strerror(errno)))")
+        // The table can grow between the two calls: retry with 1/8 more space, like Darwin arp/ndp
+        var buffer: [UInt8]
+        while true {
+            buffer = [UInt8](repeating: 0, count: size)
+            if sysctl(&mib, UInt32(mib.count), &buffer, &size, nil, 0) == 0 { break }
+            guard errno == ENOMEM else {
+                throw ArpError.systemCallFailed("sysctl dump: \(String(cString: strerror(errno)))")
+            }
+            size += size / 8
         }
         var now = timeval()
         gettimeofday(&now, nil)
@@ -62,8 +67,8 @@ final class ArpManager {
         return parseNeighborTable(Array(buffer.prefix(size)), now: Int(now.tv_sec), interfaceName: { index in
             var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
             return if_indextoname(UInt32(index), &name) != nil ? String(cString: name) : "if\(index)"
-        }, neighborInfo: { address, interface in
-            ndSocket >= 0 ? neighborDiscoveryInfo(socket: ndSocket, address: address, interface: interface) : nil
+        }, neighborInfo: { address, interfaceIndex in
+            ndSocket >= 0 ? neighborDiscoveryInfo(socket: ndSocket, address: address, interfaceIndex: interfaceIndex) : nil
         })
     }
     
@@ -86,14 +91,16 @@ final class ArpManager {
         var expire: Int32 = 0
     }
     
-    private static func neighborDiscoveryInfo(socket: Int32, address: String, interface: String) -> NeighborInfo? {
+    private static func neighborDiscoveryInfo(socket: Int32, address: String, interfaceIndex: Int) -> NeighborInfo? {
         var info = In6NeighborInfo()
-        guard inet_pton(AF_INET6, address, &info.addr) == 1 else { return nil }
+        var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+        guard inet_pton(AF_INET6, address, &info.addr) == 1,
+              if_indextoname(UInt32(interfaceIndex), &name) != nil else { return nil }
         withUnsafeMutableBytes(of: &info.ifname) { raw in
-            for (index, byte) in interface.utf8.prefix(Int(IFNAMSIZ) - 1).enumerated() { raw[index] = byte }
+            for (index, byte) in name.prefix(Int(IFNAMSIZ) - 1).enumerated() where byte != 0 { raw[index] = UInt8(bitPattern: byte) }
         }
         // The kernel expects link-local addresses with the interface index embedded in bytes 2-3 (KAME)
-        let index = if_nametoindex(interface)
+        let index = UInt32(interfaceIndex)
         withUnsafeMutableBytes(of: &info.addr) { raw in
             if raw[0] == 0xfe && raw[1] & 0xc0 == 0x80 {
                 raw[2] = UInt8(index >> 8)
@@ -111,9 +118,10 @@ final class ArpManager {
     /// - Parameters:
     ///   - now: Current time in seconds since 1970 (`rmx_expire` uses the same clock)
     ///   - interfaceName: Maps an interface index to its name
-    ///   - neighborInfo: IPv6 only – kernel state for an address on an interface; its expiry replaces `rmx_expire`, which is 0 for IPv6
+    ///   - neighborInfo: IPv6 only – kernel state for an address and interface index; its expiry replaces `rmx_expire`,
+    ///     which is always 0 for IPv6. Without it the IPv6 status is "unknown" (like `ndp`, which prints nothing then).
     static func parseNeighborTable(_ buffer: [UInt8], now: Int, interfaceName: (Int) -> String,
-                                   neighborInfo: (String, String) -> NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
+                                   neighborInfo: (String, Int) -> NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
         let headerSize = MemoryLayout<rt_msghdr>.size
         let flagsOffset = MemoryLayout<rt_msghdr>.offset(of: \rt_msghdr.rtm_flags)!
         let addrsOffset = MemoryLayout<rt_msghdr>.offset(of: \rt_msghdr.rtm_addrs)!
@@ -143,6 +151,9 @@ final class ArpManager {
             guard gateway + 8 <= offset + messageLength,
                   let ipAddress = neighborAddress(buffer, at: destination),
                   buffer[gateway + 1] == UInt8(AF_LINK) else { continue }
+            let isIPv6 = buffer[destination + 1] == UInt8(AF_INET6)
+            // ndp skips multicast groups
+            if isIPv6, buffer[destination + 8] == 0xff { continue }
             
             // sockaddr_dl: len, family, index (2), type, nlen, alen, slen, then name and LLADDR = sdl_data + nlen
             let index = Int(load(UInt16.self, at: gateway + 2))
@@ -158,10 +169,12 @@ final class ArpManager {
             }
             
             let interface = interfaceName(index)
-            let info = buffer[destination + 1] == UInt8(AF_INET6) ? neighborInfo(ipAddress, interface) : nil
+            let info = isIPv6 ? neighborInfo(ipAddress, index) : nil
             let effectiveExpire = info?.expire ?? expire
             var status: String
-            if effectiveExpire == 0 {
+            if isIPv6 && info == nil {
+                status = "unknown"
+            } else if effectiveExpire == 0 {
                 status = "permanent"
             } else if effectiveExpire <= now {
                 status = "expired"
@@ -207,14 +220,16 @@ final class ArpManager {
         }
     }
     
-    /// Link type label as printed by `arp` (net/if_types.h)
+    /// Link type label exactly as printed by Darwin `arp` (empty for types it does not name)
     static func linkTypeName(_ type: UInt8) -> String {
         switch Int32(type) {
-        case IFT_BRIDGE: return "bridge"
+        case IFT_ETHER: return "ethernet"
+        case IFT_FDDI: return "fddi"
+        case IFT_ATM: return "atm"
         case IFT_L2VLAN: return "vlan"
         case IFT_IEEE1394: return "firewire"
-        case IFT_CELLULAR: return "cellular"
-        default: return "ethernet"
+        case IFT_BRIDGE: return "bridge"
+        default: return ""
         }
     }
     
@@ -230,12 +245,14 @@ final class ArpManager {
         }
     }
     
-    /// "23h59m28s", "44s"
+    /// Duration like `ndp`'s sec2str: "1d0h0m5s", "23h59m28s", "44s"
     static func formatDuration(_ seconds: Int) -> String {
-        let hours = seconds / 3600, minutes = seconds % 3600 / 60, rest = seconds % 60
-        if hours > 0 { return "\(hours)h\(minutes)m\(rest)s" }
-        if minutes > 0 { return "\(minutes)m\(rest)s" }
-        return "\(rest)s"
+        let days = seconds / 86_400, hours = seconds / 3600 % 24, minutes = seconds / 60 % 60, rest = seconds % 60
+        var text = ""
+        if days > 0 { text += "\(days)d" }
+        if !text.isEmpty || hours > 0 { text += "\(hours)h" }
+        if !text.isEmpty || minutes > 0 { text += "\(minutes)m" }
+        return text + "\(rest)s"
     }
     #endif
     

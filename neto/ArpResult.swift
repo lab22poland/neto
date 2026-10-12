@@ -25,7 +25,7 @@ struct ArpEntry: Identifiable, Hashable {
     /// Status of the entry: "permanent", "expired" or "expires in …"
     let status: String
     
-    /// Link type as printed by `arp` ("ethernet", "bridge", …)
+    /// Link type as printed by `arp` ("ethernet", "bridge", …); empty when `arp` prints none
     var linkType: String = "ethernet"
     
     /// Whether the entry is bound to its interface (RTF_IFSCOPE, shown as "ifscope")
@@ -39,12 +39,6 @@ struct ArpEntry: Identifiable, Hashable {
     /// Human-readable description of the entry
     var description: String {
         "\(ipAddress) -> \(macAddress) (\(interface)) [\(status)]"
-    }
-    
-    /// Formats the entry to match 'arp -an' command output
-    var commandLineFormat: String {
-        let flags = [isScoped ? "ifscope" : nil, isPermanent ? "permanent" : nil].compactMap { $0 }
-        return (["? (\(ipAddress)) at \(macAddress) on \(interface)"] + flags + ["[\(linkType)]"]).joined(separator: " ")
     }
     
     /// Orders addresses numerically: IPv4 before IPv6, then byte by byte
@@ -76,26 +70,14 @@ struct ArpResult {
     /// Timestamp when the ARP table was retrieved
     let timestamp: Date
     
+    /// Entries are sorted numerically by address (IPv4 before IPv6), then by interface
     init(entries: [ArpEntry]) {
-        self.allEntries = entries
-        self.entriesByInterface = Dictionary(grouping: entries) { $0.interface }
+        let sorted = entries
+            .map { (key: $0.addressSortKey, entry: $0) }
+            .sorted { $0.key.lexicographicallyPrecedes($1.key) || ($0.key == $1.key && $0.entry.interface < $1.entry.interface) }
+            .map(\.entry)
+        self.allEntries = sorted
+        self.entriesByInterface = Dictionary(grouping: sorted) { $0.interface }
         self.timestamp = Date()
     }
-    
-    /// Returns all entries formatted as command-line output (like 'arp -an')
-    var commandLineOutput: String {
-        return allEntries
-            .sorted { $0.addressSortKey.lexicographicallyPrecedes($1.addressSortKey) || ($0.addressSortKey == $1.addressSortKey && $0.interface < $1.interface) }
-            .map { $0.commandLineFormat }
-            .joined(separator: "\n")
-    }
-    
-    /// Returns entries for a specific interface formatted as command-line output
-    func commandLineOutput(for interface: String) -> String {
-        let entries = interface == "All" ? allEntries : (entriesByInterface[interface] ?? [])
-        return entries
-            .sorted { $0.addressSortKey.lexicographicallyPrecedes($1.addressSortKey) }
-            .map { $0.commandLineFormat }
-            .joined(separator: "\n")
-    }
-} 
+}
