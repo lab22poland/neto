@@ -61,7 +61,8 @@ struct LiveNetworkTests {
 
     @Test func domainNameResolves() async throws {
         let host = try await TracerouteManager().resolveHost("example.com")
-        #expect(host.family == AF_INET)
+        #expect(host.family == AF_INET || host.family == AF_INET6)
+        #expect(!host.ipAddress.isEmpty)
     }
 
     @Test @MainActor func pingPublicResolver() async {

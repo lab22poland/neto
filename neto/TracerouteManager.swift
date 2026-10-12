@@ -38,6 +38,8 @@ final class TracerouteManager {
     private var sendTimes: [UInt16: Date] = [:]
     private var replies: [UInt16: (time: Double, address: String, reply: ICMPPacket.ProbeReply)] = [:]
     private var runTask: Task<Void, Never>?
+    /// Set when receiving fails hard (e.g. EPERM in the sandbox); ends the run
+    private var socketError: Error?
 
     // MARK: - Public Methods
 
@@ -49,6 +51,7 @@ final class TracerouteManager {
     ///   - onResult: Called on the main actor with one result per hop; called again with the same `id` when the router's name is resolved
     ///   - onComplete: Called exactly once when the run ends, including after cancellation
     /// - Returns: A Task that can be cancelled
+    @MainActor
     func performTraceroute(
         to host: String,
         maxHops: Int = 30,
@@ -94,7 +97,7 @@ final class TracerouteManager {
     func resolveHost(_ host: String) async throws -> ResolvedHost {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let kind = try classifyHost(trimmedHost)
-        return try await Task.detached(priority: .userInitiated) {
+        return try await Self.runBlocking {
             var hints = addrinfo()
             hints.ai_family = AF_UNSPEC
             hints.ai_socktype = SOCK_DGRAM
@@ -119,7 +122,7 @@ final class TracerouteManager {
                 throw TracerouteError.resolutionFailed(trimmedHost, "no IPv4 or IPv6 address")
             }
             return best
-        }.value
+        }
     }
 
     /// Validates IPv4 address format strictly
@@ -150,7 +153,9 @@ final class TracerouteManager {
     func formatHopMessage(
         ipAddress: String?,
         hostname: String?,
-        isDestination: Bool
+        isDestination: Bool,
+        unreachableCode: UInt8? = nil,
+        family: Int32 = AF_INET
     ) -> String {
         var components: [String] = []
 
@@ -162,7 +167,10 @@ final class TracerouteManager {
             components.append("(\(ipAddress))")
         }
 
-        let hostInfo = components.isEmpty ? "* * *" : components.joined(separator: " ")
+        var hostInfo = components.isEmpty ? "* * *" : components.joined(separator: " ")
+        if let unreachableCode {
+            hostInfo += " " + Self.unreachableAnnotation(code: unreachableCode, family: family)
+        }
 
         if isDestination {
             return "\(hostInfo) [DESTINATION REACHED]"
@@ -175,20 +183,34 @@ final class TracerouteManager {
 
     @MainActor
     private func trace(host: String, maxHops: Int, timeout: TimeInterval, deliver: @escaping (TracerouteResult) -> Void) async {
+        guard maxHops >= 1 else { return }
         let target: ResolvedHost
         do {
             target = try await resolveHost(host)
-            try openSocket(family: target.family)
         } catch {
-            deliver(TracerouteResult(hopNumber: 1, success: false, responseTime: 0,
-                                     message: "Failed to resolve host: \(host) - \(error.localizedDescription)"))
+            if !Task.isCancelled {
+                deliver(TracerouteResult(hopNumber: 1, success: false, responseTime: 0,
+                                         message: "Failed to resolve host: \(host) - \(error.localizedDescription)"))
+            }
             return
         }
+        if Task.isCancelled { return }
 
-        for hop in 1...max(1, maxHops) {
+        for hop in 1...maxHops {
             if Task.isCancelled { return }
-            let sequenceNumbers = sendProbes(to: target, hopLimit: hop)
-            await waitForReplies(to: sequenceNumbers, timeout: timeout)
+            let sequenceNumbers: [UInt16]
+            do {
+                if hop == 1 { try openSocket(family: target.family) }
+                sequenceNumbers = try sendProbes(to: target, hopLimit: hop)
+                await waitForReplies(to: sequenceNumbers, timeout: timeout)
+                if let socketError { throw socketError }
+            } catch {
+                if !Task.isCancelled {
+                    deliver(TracerouteResult(hopNumber: hop, success: false, responseTime: 0,
+                                             message: "Traceroute failed: \(error.localizedDescription)"))
+                }
+                return
+            }
             if Task.isCancelled { return }
 
             let answered = sequenceNumbers.compactMap { replies[$0] }
@@ -198,7 +220,9 @@ final class TracerouteManager {
                 if case .destinationUnreachable = reply.reply { return reply.address == target.ipAddress }
                 return false
             }
-            let unreachable = answered.contains { if case .destinationUnreachable = $0.reply { return true } else { return false } }
+            let unreachableCode = answered.lazy.compactMap { reply -> UInt8? in
+                if case .destinationUnreachable(_, let code) = reply.reply { return code } else { return nil }
+            }.first
             let probeTimes: [Double?] = sequenceNumbers.map { replies[$0]?.time }
             let times = probeTimes.compactMap { $0 }
             let result = TracerouteResult(
@@ -206,28 +230,30 @@ final class TracerouteManager {
                 success: !answered.isEmpty,
                 ipAddress: routerAddress,
                 responseTime: times.isEmpty ? 0 : times.reduce(0, +) / Double(times.count),
-                message: formatHopMessage(ipAddress: routerAddress, hostname: nil, isDestination: reachedTarget),
+                message: formatHopMessage(ipAddress: routerAddress, hostname: nil, isDestination: reachedTarget,
+                                          unreachableCode: unreachableCode, family: family),
                 isDestination: reachedTarget,
-                probeTimes: probeTimes
+                probeTimes: probeTimes,
+                unreachableCode: unreachableCode
             )
             deliver(result)
             if let routerAddress {
                 resolveName(of: result, address: routerAddress, deliver: deliver)
             }
             // The path ends at the target, or where a router reports the target unreachable
-            if reachedTarget || unreachable { return }
+            if reachedTarget || unreachableCode != nil { return }
         }
     }
 
     /// Sends the probes of one hop and returns their sequence numbers
     @MainActor
-    private func sendProbes(to target: ResolvedHost, hopLimit: Int) -> [UInt16] {
+    private func sendProbes(to target: ResolvedHost, hopLimit: Int) throws -> [UInt16] {
         var limit = Int32(hopLimit)
-        if family == AF_INET6 {
-            setsockopt(socketFD, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &limit, socklen_t(MemoryLayout<Int32>.size))
-        } else {
-            setsockopt(socketFD, IPPROTO_IP, IP_TTL, &limit, socklen_t(MemoryLayout<Int32>.size))
-        }
+        let status = family == AF_INET6
+            ? setsockopt(socketFD, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &limit, socklen_t(MemoryLayout<Int32>.size))
+            : setsockopt(socketFD, IPPROTO_IP, IP_TTL, &limit, socklen_t(MemoryLayout<Int32>.size))
+        // Without the hop limit the probes would reach the target and hop 1 would look like the destination
+        guard status == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         var sent: [UInt16] = []
         for _ in 0..<Self.probesPerHop {
             let sequenceNumber = nextSequenceNumber
@@ -257,12 +283,10 @@ final class TracerouteManager {
     /// Looks up the router's name in the background and re-delivers the row with it (ignored if it arrives too late)
     @MainActor
     private func resolveName(of result: TracerouteResult, address: String, deliver: @escaping (TracerouteResult) -> Void) {
+        let family = self.family
         Task { @MainActor in
-            let lookup = Task.detached(priority: .utility) { Self.reverseLookup(address) }
-            let timeoutTask = Task { try? await Task.sleep(nanoseconds: 2_000_000_000); lookup.cancel() }
-            let name = await lookup.value
-            timeoutTask.cancel()
-            guard let name, !lookup.isCancelled, name != address else { return }
+            let lookedUp = (try? await Self.runBlocking(timeout: 2) { Self.reverseLookup(address) }) ?? nil
+            guard let name = lookedUp, name != address else { return }
             deliver(TracerouteResult(
                 id: result.id,
                 hopNumber: result.hopNumber,
@@ -270,9 +294,11 @@ final class TracerouteManager {
                 ipAddress: result.ipAddress,
                 hostname: name,
                 responseTime: result.responseTime,
-                message: formatHopMessage(ipAddress: address, hostname: name, isDestination: result.isDestination),
+                message: formatHopMessage(ipAddress: address, hostname: name, isDestination: result.isDestination,
+                                          unreachableCode: result.unreachableCode, family: family),
                 isDestination: result.isDestination,
-                probeTimes: result.probeTimes
+                probeTimes: result.probeTimes,
+                unreachableCode: result.unreachableCode
             ))
         }
     }
@@ -286,6 +312,7 @@ final class TracerouteManager {
         identifier = UInt16.random(in: 1...UInt16.max)
         sendTimes.removeAll()
         replies.removeAll()
+        socketError = nil
 
         let fd = Darwin.socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -322,7 +349,15 @@ final class TracerouteManager {
             let count = withUnsafeMutablePointer(to: &from) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buffer, buffer.count, 0, $0, &fromLength) }
             }
-            guard count > 0 else { return }   // EAGAIN or error: wait for the next read event
+            if count < 0 {
+                let error = errno
+                if error == EAGAIN || error == EWOULDBLOCK || error == EINTR { return }
+                // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source
+                socketError = POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+                closeSocket()
+                return
+            }
+            guard count > 0 else { return }
             let received = Date()
             // Every ICMP socket sees all ICMP traffic of the host, so only replies to our identifier count
             guard let reply = ICMPPacket.probeReply(in: Data(buffer[0..<count]), family: family, identifier: identifier),
@@ -330,6 +365,51 @@ final class TracerouteManager {
                   replies[reply.sequenceNumber] == nil else { continue }
             let address = withUnsafeBytes(of: &from) { Self.numericHost(Data($0.prefix(Int(fromLength)))) } ?? "?"
             replies[reply.sequenceNumber] = (received.timeIntervalSince(sent) * 1000, address, reply)
+        }
+    }
+
+    /// traceroute-style annotation of an ICMP Destination Unreachable code
+    static func unreachableAnnotation(code: UInt8, family: Int32) -> String {
+        if family == AF_INET6 {
+            // RFC 4443: 0 no route, 1 administratively prohibited, 3 address unreachable, 4 port unreachable
+            switch code {
+            case 0: return "!N"
+            case 1: return "!X"
+            case 3: return "!H"
+            case 4: return "!P"
+            default: return "!<\(code)>"
+            }
+        }
+        // RFC 792 / RFC 1812: 0 net, 1 host, 2 protocol, 3 port, 9/10/13 administratively prohibited
+        switch code {
+        case 0: return "!N"
+        case 1: return "!H"
+        case 2, 3: return "!P"
+        case 9, 10, 13: return "!X"
+        default: return "!<\(code)>"
+        }
+    }
+
+    // MARK: - Blocking Calls
+
+    /// Runs a blocking resolver call on a global queue, off the cooperative thread pool.
+    /// Cancellation or the optional timeout resumes the caller right away; the call itself finishes in the background.
+    static func runBlocking<T>(timeout: TimeInterval? = nil, _ work: @escaping @Sendable () throws -> T) async throws -> T {
+        let once = ResumeOnce<T>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                once.set(continuation)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    once.resume(with: Result { try work() })
+                }
+                if let timeout {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                        once.resume(with: .failure(CancellationError()))
+                    }
+                }
+            }
+        } onCancel: {
+            once.resume(with: .failure(CancellationError()))
         }
     }
 
@@ -359,6 +439,38 @@ final class TracerouteManager {
 }
 
 // MARK: - Supporting Types
+
+/// Resumes a continuation exactly once from whichever thread gets there first
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+    private var pending: Result<T, Error>?
+
+    func set(_ continuation: CheckedContinuation<T, Error>) {
+        lock.lock()
+        if let pending {
+            self.pending = nil
+            lock.unlock()
+            continuation.resume(with: pending)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume(with result: Result<T, Error>) {
+        lock.lock()
+        if let continuation {
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(with: result)
+            return
+        }
+        // Not set yet (cancelled before start): remember the first result only
+        if pending == nil { pending = result }
+        lock.unlock()
+    }
+}
 
 enum TracerouteError: LocalizedError {
     case invalidHost(String)

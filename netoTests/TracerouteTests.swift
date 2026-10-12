@@ -65,6 +65,14 @@ struct TracerouteManagerLogicTests {
         #expect(manager.formatHopMessage(ipAddress: nil, hostname: nil, isDestination: false) == "* * *")
     }
 
+    @Test(arguments: [(UInt8(0), Int32(AF_INET), "!N"), (1, AF_INET, "!H"), (13, AF_INET, "!X"), (7, AF_INET, "!<7>"),
+                      (1, AF_INET6, "!X"), (3, AF_INET6, "!H")])
+    func unreachableAnnotation(code: UInt8, family: Int32, annotation: String) {
+        #expect(TracerouteManager.unreachableAnnotation(code: code, family: family) == annotation)
+        #expect(TracerouteManager().formatHopMessage(ipAddress: "10.0.0.1", hostname: nil, isDestination: false,
+                                                     unreachableCode: code, family: family) == "(10.0.0.1) \(annotation)")
+    }
+
     @Test func probeTimesFormatting() {
         let result = TracerouteResult(hopNumber: 1, success: true, responseTime: 2, message: "", probeTimes: [1.234, nil, 3])
         #expect(result.formattedProbeTimes == "1.23 ms  *  3.00 ms")
@@ -124,7 +132,7 @@ final class TracerouteLoopbackTests: XCTestCase {
     }
 }
 
-/// Parameter validation, progress and late-update handling in the view model
+/// Parameter validation, progress and row updates in the view model
 @MainActor
 struct TracerouteViewModelTests {
 
@@ -160,6 +168,23 @@ struct TracerouteViewModelTests {
         viewModel.stopTraceroute()
         #expect(viewModel.tracerouteResults.last?.message == "Traceroute stopped by user")
         #expect(viewModel.currentHop == 2, "the stop row is not a hop")
+    }
+
+    @Test func nameUpdateReplacesRow() {
+        let viewModel = TracerouteViewModel()
+        let hop = TracerouteResult(hopNumber: 1, success: true, ipAddress: "10.0.0.1", responseTime: 1, message: "(10.0.0.1)")
+        viewModel.handleTracerouteResult(hop)
+        viewModel.handleTracerouteResult(TracerouteResult(id: hop.id, hopNumber: 1, success: true, ipAddress: "10.0.0.1",
+                                                          hostname: "gw.local", responseTime: 1, message: "gw.local (10.0.0.1)"))
+        #expect(viewModel.tracerouteResults.count == 1)
+        #expect(viewModel.tracerouteResults.first?.hostname == "gw.local")
+    }
+
+    @Test func nameUpdateForRemovedRowIsDropped() {
+        let viewModel = TracerouteViewModel()
+        viewModel.handleTracerouteResult(TracerouteResult(hopNumber: 1, success: true, ipAddress: "10.0.0.1",
+                                                          hostname: "gw.local", responseTime: 1, message: "gw.local (10.0.0.1)"))
+        #expect(viewModel.tracerouteResults.isEmpty, "a late name for a cleared row must not resurrect it")
     }
 
     @Test func destinationCompletesProgress() {

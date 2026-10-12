@@ -37,6 +37,9 @@ struct TracerouteResult: Identifiable {
     /// Round-trip time of each probe sent to this hop in milliseconds, nil for a probe without reply
     let probeTimes: [Double?]
     
+    /// ICMP Destination Unreachable code that ended the trace at this hop, if any
+    let unreachableCode: UInt8?
+    
     init(
         id: UUID = UUID(),
         hopNumber: Int,
@@ -46,7 +49,8 @@ struct TracerouteResult: Identifiable {
         responseTime: Double,
         message: String,
         isDestination: Bool = false,
-        probeTimes: [Double?] = []
+        probeTimes: [Double?] = [],
+        unreachableCode: UInt8? = nil
     ) {
         self.id = id
         self.hopNumber = hopNumber
@@ -57,6 +61,7 @@ struct TracerouteResult: Identifiable {
         self.message = message
         self.isDestination = isDestination
         self.probeTimes = probeTimes
+        self.unreachableCode = unreachableCode
     }
     
     /// Probe times as shown by traceroute, e.g. "1.23 ms  4.56 ms  *"

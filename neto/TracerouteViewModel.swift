@@ -135,8 +135,8 @@ final class TracerouteViewModel: ObservableObject {
     
     // MARK: - Private Methods
     
-    /// Handles individual traceroute results
-    private func handleTracerouteResult(_ result: TracerouteResult) {
+    /// Appends a hop, or replaces it when the same row comes back with the router's name (internal for tests)
+    func handleTracerouteResult(_ result: TracerouteResult) {
         if let index = tracerouteResults.firstIndex(where: { $0.id == result.id }) {
             // Same hop again, now with the router's name
             tracerouteResults[index] = result
