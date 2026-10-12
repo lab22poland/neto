@@ -35,14 +35,14 @@ struct LiveNetworkTests {
     func domainReferral(domain: String, server: String) async {
         let result = await whois(domain)
         #expect(result.success, "\(result.statusMessage)")
-        #expect(result.whoisServer == server)
+        #expect(result.whoisServer == server, "\(result.statusMessage)")   // says which referral did not answer and why
     }
 
     @Test(arguments: [("8.8.8.8", "whois.arin.net"), ("193.0.6.139", "whois.ripe.net")])
     func addressReferral(address: String, server: String) async {
         let result = await whois(address)
         #expect(result.success, "\(result.statusMessage)")
-        #expect(result.whoisServer == server)
+        #expect(result.whoisServer == server, "\(result.statusMessage)")
     }
 
     @Test @MainActor func tracerouteReachesPublicResolverThroughRouters() async {

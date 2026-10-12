@@ -10,14 +10,29 @@ import Foundation
 
 /// Represents the result of a WHOIS query
 struct WhoisResult: Identifiable {
+    /// What the last server's answer says about the queried object
+    enum Outcome: Equatable {
+        /// The last server answered with a record (summary fields come from that answer)
+        case found
+        /// The last server said it has no such object, or returned no data
+        case notFound
+        /// A referral server did not answer or an answer was cut off; the raw response is partial
+        case incomplete
+        /// The chain ended at IANA, whose record describes the TLD or address block, not the query
+        case ianaOnly
+    }
+    
     /// Unique identifier for the WHOIS result
     let id: UUID
     
     /// The domain/IP address that was queried
     let domain: String
     
-    /// Whether the WHOIS query was successful
+    /// Whether the WHOIS query was successful (at least the first server answered)
     let success: Bool
+    
+    /// Whether the answer describes the queried object; only meaningful when `success` is true
+    let outcome: Outcome
     
     /// Raw WHOIS response data
     let rawResponse: String
@@ -40,13 +55,14 @@ struct WhoisResult: Identifiable {
     /// Human-readable status message
     let statusMessage: String
     
-    /// Response time in milliseconds
-    let responseTime: Double
+    /// Response time in milliseconds; nil when it was not measured (e.g. the lookup was stopped)
+    let responseTime: Double?
     
     init(
         id: UUID = UUID(),
         domain: String,
         success: Bool,
+        outcome: Outcome = .found,
         rawResponse: String = "",
         registrar: String? = nil,
         registrationDate: String? = nil,
@@ -54,11 +70,12 @@ struct WhoisResult: Identifiable {
         nameServers: [String] = [],
         whoisServer: String? = nil,
         statusMessage: String,
-        responseTime: Double
+        responseTime: Double?
     ) {
         self.id = id
         self.domain = domain
         self.success = success
+        self.outcome = outcome
         self.rawResponse = rawResponse
         self.registrar = registrar
         self.registrationDate = registrationDate

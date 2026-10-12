@@ -144,12 +144,12 @@ final class WhoisManager {
         var visitedRIRs = Set<String>()
         var output = ""
         var lastServerOutput = ""
-        var status = "WHOIS lookup successful"
+        var incompleteReason: String?
         var answeredServer = server
         
         for hop in 0...Self.maxReferrals {
             if Task.isCancelled { throw CancellationError() }
-            let response: [UInt8]
+            let response: ServerAnswer
             do {
                 // whois.c gethostinfo(): an unresolvable host ends the lookup right away
                 guard let canonicalName = await Self.resolveCanonicalName(of: server) else {
@@ -160,11 +160,14 @@ final class WhoisManager {
                 // The first server failing fails the lookup; a later one keeps what was printed so far, like whois.c's err()
                 if hop == 0 || Task.isCancelled || error is CancellationError { throw error }
                 output += "whois: \(server): \(error.localizedDescription)\n"
-                status = "WHOIS lookup incomplete: \(server) failed"
+                incompleteReason = "Incomplete: \(server) did not answer (\(error.localizedDescription))"
                 break
             }
             answeredServer = server
-            let processed = processResponse(response, server: server)
+            if let cutOff = response.cutOff, incompleteReason == nil {
+                incompleteReason = "Incomplete: \(server) \(cutOff)"
+            }
+            let processed = processResponse(response.bytes, server: server)
             let text = Self.decode(processed.output)
             output += text
             lastServerOutput = text
@@ -180,20 +183,21 @@ final class WhoisManager {
         let endTime = Date()
         let responseTime = endTime.timeIntervalSince(startTime) * 1000
         
-        // Fields come from the most specific (last) server; the whole chain is shown as the raw response
-        let last = parseWhoisResponse(lastServerOutput, for: query)
-        let all = parseWhoisResponse(output, for: query)
+        // Fields come only from the most specific (last) server; the whole chain is shown as the raw response
+        let summary = summarize(lastAnswer: lastServerOutput, server: answeredServer, query: query,
+                                incompleteReason: incompleteReason)
         
         return WhoisResult(
             domain: query,
             success: true,
+            outcome: summary.outcome,
             rawResponse: output,
-            registrar: last.registrar ?? all.registrar,
-            registrationDate: last.registrationDate ?? all.registrationDate,
-            expirationDate: last.expirationDate ?? all.expirationDate,
-            nameServers: last.nameServers.isEmpty ? all.nameServers : last.nameServers,
+            registrar: summary.fields.registrar,
+            registrationDate: summary.fields.registrationDate,
+            expirationDate: summary.fields.expirationDate,
+            nameServers: summary.fields.nameServers,
             whoisServer: answeredServer,   // the last server that answered (a failed referral is reported in the raw response)
-            statusMessage: status,
+            statusMessage: summary.status,
             responseTime: responseTime
         )
     }
@@ -256,12 +260,14 @@ final class WhoisManager {
     }
     
     /// RFC 3912 query: send the formatted query, read until the server closes the connection.
-    /// Like whois.c's fgetln loop, a read error after some data ends the answer instead of failing it.
-    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43", canonicalName: String? = nil) async throws -> [UInt8] {
+    /// Only a failed connect fails the query (whois.c: err "connect()"). Once connected, an error ends the answer
+    /// like EOF, even with no data yet: whois.c's fgetln loop stops on a read error and never checks ferror()
+    /// (seen live: whois.markmonitor.com resets throttled connections without sending anything).
+    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43", canonicalName: String? = nil) async throws -> ServerAnswer {
         guard let endpointPort = NWEndpoint.Port(port) else { throw WhoisError.invalidPort(server, port) }
         let formattedQuery = formatQueryForServer(query: query, server: server, canonicalName: canonicalName)
         let connection = NWConnection(host: NWEndpoint.Host(server), port: endpointPort, using: .tcp)
-        let completion = CompletionOnce<[UInt8]>()
+        let completion = CompletionOnce<ServerAnswer>()
         let buffer = ResponseBuffer()
         
         return try await withTaskCancellationHandler {
@@ -271,16 +277,21 @@ final class WhoisManager {
                 connection.stateUpdateHandler = { state in
                     switch state {
                     case .ready:
+                        buffer.markConnected()
                         connection.send(content: Data(formattedQuery.utf8), completion: .contentProcessed { error in
                             if let error {
-                                completion.finish(.failure(error))
+                                Self.endAnswer(after: error, buffer: buffer, completion: completion)   // whois.c ignores fprintf errors
                             } else {
                                 Self.readAll(connection: connection, into: buffer, completion: completion)
                             }
                         })
                     case .waiting(let error), .failed(let error):
-                        // .waiting = the host cannot be reached now (e.g. no DNS record); whois.c fails right away
-                        completion.finish(.failure(error))
+                        if buffer.isConnected {
+                            Self.endAnswer(after: error, buffer: buffer, completion: completion)
+                        } else {
+                            // connect() failed; .waiting = the host cannot be reached now (e.g. no DNS record), whois.c fails right away
+                            completion.finish(.failure(error))
+                        }
                     case .cancelled:
                         completion.finish(.failure(CancellationError()))
                     default:
@@ -288,10 +299,13 @@ final class WhoisManager {
                     }
                 }
                 connection.start(queue: .global())
-                DispatchQueue.global().asyncAfter(deadline: .now() + connectionTimeout) {
-                    // Like a read error: what arrived so far is the answer
+                let timeout = connectionTimeout
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    // Like a read error: what arrived so far is the answer, marked as cut off
                     let received = buffer.bytes
-                    completion.finish(received.isEmpty ? .failure(URLError(.timedOut)) : .success(received))
+                    completion.finish(received.isEmpty
+                                      ? .failure(URLError(.timedOut))
+                                      : .success(ServerAnswer(bytes: received, cutOff: "answer cut off after \(Int(timeout)) s")))
                 }
             }
         } onCancel: {
@@ -299,19 +313,27 @@ final class WhoisManager {
         }
     }
     
-    /// Reads until the server closes the connection; an error after data counts as the end of the answer
-    private static func readAll(connection: NWConnection, into buffer: ResponseBuffer, completion: CompletionOnce<[UInt8]>) {
+    /// Reads until the server closes the connection; an error ends the answer (see `endAnswer`)
+    private static func readAll(connection: NWConnection, into buffer: ResponseBuffer, completion: CompletionOnce<ServerAnswer>) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
             if let data { buffer.append(data) }
             if let error {
-                let received = buffer.bytes
-                completion.finish(received.isEmpty ? .failure(error) : .success(received))
+                endAnswer(after: error, buffer: buffer, completion: completion)
             } else if isComplete {
-                completion.finish(.success(buffer.bytes))
+                completion.finish(.success(ServerAnswer(bytes: buffer.bytes, cutOff: nil)))
             } else {
                 readAll(connection: connection, into: buffer, completion: completion)
             }
         }
+    }
+    
+    /// An error on a connected socket ends the answer with what arrived so far (possibly nothing), marked as incomplete
+    private static func endAnswer(after error: Error, buffer: ResponseBuffer, completion: CompletionOnce<ServerAnswer>) {
+        let received = buffer.bytes
+        let reason = received.isEmpty
+            ? "closed the connection without an answer (\(error.localizedDescription))"
+            : "answer cut off by a connection error (\(error.localizedDescription))"
+        completion.finish(.success(ServerAnswer(bytes: received, cutOff: reason)))
     }
     
     /// Text of a server's answer: UTF-8, or ISO Latin-1 when the bytes are not valid UTF-8 (decoded per server)
@@ -457,110 +479,131 @@ final class WhoisManager {
         referral(in: Array(line.utf8), prefixes: prefixes.map { Array($0.utf8) })
     }
     
-    /// Enhanced WHOIS response parsing (more comprehensive than before)
-    func parseWhoisResponse(_ response: String, for query: String) -> (
-        registrar: String?,
-        registrationDate: String?,
-        expirationDate: String?,
-        nameServers: [String]
-    ) {
-        let lines = response.components(separatedBy: .newlines)
-        var registrar: String?
-        var registrationDate: String?
-        var expirationDate: String?
+    /// Summary fields shown above the raw response
+    typealias WhoisFields = (registrar: String?, registrationDate: String?, expirationDate: String?, nameServers: [String])
+    
+    /// Keys in order of preference: the first key present wins, and within a key the first line wins
+    /// (ARIN `OrgName:` before its `Organization: Name (HANDLE)`, RIPE `org-name:` before the `organisation:` handle)
+    static let registrarKeys = ["registrar:", "registrar name:", "sponsoring registrar:", "orgname:", "org-name:",
+                                "organization:", "organisation:", "maintainer:"]
+    /// `Registered on:` (Nominet), `RegDate:` (ARIN), `created:` (RIPE, NASK, IANA)
+    static let creationKeys = ["creation date:", "created:", "registered on:", "registered:", "registration date:",
+                               "domain registration date:", "register date:", "regdate:"]
+    /// `Registrar Registration Expiration Date:` (registrars such as MarkMonitor), `Expiry date:` (Nominet), `renewal date:` (NASK)
+    static let expirationKeys = ["registry expiry date:", "registrar registration expiration date:", "expiry date:",
+                                 "expiration date:", "expires:", "paid-till:", "renewal date:"]
+    /// `Name servers:` (Nominet) and `nameservers:` (NASK) start an indented block
+    static let nameServerKeys = ["name server:", "name servers:", "nameserver:", "nameservers:", "nserver:", "ns:",
+                                 "domain name servers:"]
+    
+    /// Line starts (case-insensitive, after leading spaces) with which the servers say the object does not exist,
+    /// as returned live: Verisign .com/.net and Nominet ("No match for"), ARIN ("No match found for"),
+    /// PIR .org and Identity Digital .io ("Domain not found."), NASK .pl, DENIC ("Status: free")
+    static let notFoundMarkers = ["no match for ", "no match found for ", "domain not found.",
+                                  "no information available about domain name ", "status: free"]
+    
+    /// Parses the summary fields of ONE server's answer (callers pass only the last server's text).
+    /// A key with an empty value takes the next line as its value when that line is not another "Key: value"
+    /// (NASK `REGISTRAR:`, Nominet `Registrar:`); a name server key also takes the following, more indented lines.
+    /// Name servers are reduced to the host name (no addresses, no trailing dot). Empty values are nil, never "".
+    func parseWhoisResponse(_ response: String, for query: String) -> WhoisFields {
+        let lines = response.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n")
+        let valueKeys = Self.registrarKeys + Self.creationKeys + Self.expirationKeys
+        var values: [String: String] = [:]
         var nameServers: [String] = []
         
-        for line in lines {
-            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            let lowercaseLine = trimmedLine.lowercased()
+        func trim<S: StringProtocol>(_ text: S) -> String { text.trimmingCharacters(in: .whitespaces) }
+        func indent(_ line: String) -> Int { line.prefix(while: { $0 == " " || $0 == "\t" }).count }
+        func isComment(_ trimmed: String) -> Bool { trimmed.hasPrefix("%") || trimmed.hasPrefix("#") }
+        
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            index += 1
+            let trimmed = trim(line)
+            if trimmed.isEmpty || isComment(trimmed) { continue }
+            let lower = trimmed.lowercased()
             
-            // Skip comment lines and empty lines (FreeBSD behavior)
-            if trimmedLine.isEmpty || trimmedLine.hasPrefix("%") || trimmedLine.hasPrefix("#") {
-                continue
-            }
-            
-            // Parse registrar information (comprehensive patterns)
-            if registrar == nil {
-                let registrarPatterns = [
-                    "registrar:",
-                    "registrar name:",
-                    "organisation:",
-                    "org-name:",
-                    "sponsoring registrar:",
-                    "maintainer:"
-                ]
-                
-                for pattern in registrarPatterns {
-                    if lowercaseLine.hasPrefix(pattern) {
-                        registrar = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        break
+            if let key = Self.nameServerKeys.first(where: { lower.hasPrefix($0) }) {
+                var entries = [trim(trimmed.dropFirst(key.count))]
+                while index < lines.count, !trim(lines[index]).isEmpty, indent(lines[index]) > indent(line) {
+                    entries.append(trim(lines[index]))
+                    index += 1
+                }
+                for entry in entries {
+                    guard let token = entry.split(whereSeparator: { $0 == " " || $0 == "\t" }).first else { continue }
+                    let host = token.hasSuffix(".") ? String(token.dropLast()) : String(token)
+                    if !host.isEmpty, !nameServers.contains(where: { $0.caseInsensitiveCompare(host) == .orderedSame }) {
+                        nameServers.append(host)
                     }
                 }
-            }
-            
-            // Parse registration/creation date (comprehensive patterns)
-            if registrationDate == nil {
-                let creationPatterns = [
-                    "creation date:",
-                    "created:",
-                    "registered:",
-                    "registration date:",
-                    "domain registration date:",
-                    "register date:"
-                ]
-                
-                for pattern in creationPatterns {
-                    if lowercaseLine.hasPrefix(pattern) {
-                        registrationDate = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        break
+            } else if let key = valueKeys.first(where: { lower.hasPrefix($0) }), values[key] == nil {
+                var value = trim(trimmed.dropFirst(key.count))
+                if value.isEmpty, index < lines.count {
+                    let next = trim(lines[index])
+                    if !next.isEmpty, !isComment(next), !next.hasSuffix(":"), !next.contains(": ") {
+                        value = next
                     }
                 }
-            }
-            
-            // Parse expiration date (comprehensive patterns)
-            if expirationDate == nil {
-                let expirationPatterns = [
-                    "registry expiry date:",
-                    "expiry date:",
-                    "expires:",
-                    "expiration date:",
-                    "paid-till:",
-                    "renewal date:"
-                ]
-                
-                for pattern in expirationPatterns {
-                    if lowercaseLine.hasPrefix(pattern) {
-                        expirationDate = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        break
-                    }
-                }
-            }
-            
-            // Parse name servers (comprehensive patterns)
-            let nameServerPatterns = [
-                "name server:",
-                "nserver:",
-                "nameserver:",
-                "ns:",
-                "domain name servers:"
-            ]
-            
-            for pattern in nameServerPatterns {
-                if lowercaseLine.hasPrefix(pattern) {
-                    let nameServer = String(trimmedLine.dropFirst(pattern.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !nameServer.isEmpty && !nameServers.contains(nameServer) {
-                        nameServers.append(nameServer)
-                    }
-                    break
-                }
+                if !value.isEmpty { values[key] = value }
             }
         }
         
-        return (registrar, registrationDate, expirationDate, nameServers)
+        func first(_ keys: [String]) -> String? { keys.lazy.compactMap { values[$0] }.first }
+        return (first(Self.registrarKeys), first(Self.creationKeys), first(Self.expirationKeys), nameServers)
+    }
+    
+    /// Whether the answer says the object does not exist (see `notFoundMarkers`)
+    func isNotFound(_ answer: String) -> Bool {
+        answer.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n").contains { line in
+            let lower = line.trimmingCharacters(in: .whitespaces).lowercased()
+            return Self.notFoundMarkers.contains { lower.hasPrefix($0) }
+        }
+    }
+    
+    /// Decides what the summary may show, from the LAST server's answer only. IANA's answer describes the TLD or
+    /// address block (registry operator, TLD creation date, TLD name servers), so it yields fields only when its
+    /// `domain:` is the query itself (e.g. "uk"). Not found or an empty answer shows no fields; an incomplete chain says so.
+    func summarize(lastAnswer: String, server: String, query: String, incompleteReason: String?) -> (
+        outcome: WhoisResult.Outcome, status: String, fields: WhoisFields
+    ) {
+        let none: WhoisFields = (nil, nil, nil, [])
+        if isNotFound(lastAnswer) {
+            return (.notFound, "Not found: \(server) has no record for \(query)", none)
+        }
+        let onlyIANABlock = server.caseInsensitiveCompare(ianaHost) == .orderedSame && !ianaRecordIsQuery(lastAnswer, query: query)
+        let fields = onlyIANABlock ? none : parseWhoisResponse(lastAnswer, for: query)
+        if let incompleteReason {
+            return (.incomplete, incompleteReason, fields)
+        }
+        if lastAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // No record (RIPE's "no entries found" is a stripped comment) or a throttling server: it cannot be told apart
+            return (.notFound, "No data: \(server) returned an empty answer for \(query)", none)
+        }
+        if onlyIANABlock {
+            return (.ianaOnly, "No registry record: IANA refers to no other WHOIS server; its answer describes the TLD or address block, not \(query)", none)
+        }
+        return (.found, "WHOIS lookup successful", fields)
+    }
+    
+    /// Whether IANA's answer is the record of the query itself (a TLD such as "uk"), not of the TLD above it
+    private func ianaRecordIsQuery(_ answer: String, query: String) -> Bool {
+        let wanted = query.hasSuffix(".") ? String(query.dropLast()) : query
+        return answer.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n").contains { line in
+            guard line.lowercased().hasPrefix("domain:") else { return false }
+            return line.dropFirst("domain:".count).trimmingCharacters(in: .whitespaces)
+                .caseInsensitiveCompare(wanted) == .orderedSame
+        }
     }
 }
 
 // MARK: - Supporting Types
+
+/// One server's answer; `cutOff` says why it may be partial (timeout or read error after some data)
+struct ServerAnswer {
+    let bytes: [UInt8]
+    let cutOff: String?
+}
 
 enum WhoisError: LocalizedError {
     case hostNotFound(String)
@@ -574,10 +617,23 @@ enum WhoisError: LocalizedError {
     }
 }
 
-/// Bytes received so far, shared between the read callbacks and the timeout
+/// Bytes received so far and whether the connection was established, shared between the callbacks and the timeout
 private final class ResponseBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [UInt8] = []
+    private var connected = false
+
+    func markConnected() {
+        lock.lock()
+        connected = true
+        lock.unlock()
+    }
+
+    var isConnected: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return connected
+    }
 
     func append(_ data: Data) {
         lock.lock()
