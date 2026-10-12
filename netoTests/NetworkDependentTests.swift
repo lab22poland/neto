@@ -20,7 +20,7 @@ extension Tag {
     @Tag static var network: Self
 }
 
-@Suite(.tags(.network), .enabled(if: NetworkTests.enabled, "set TEST_RUNNER_NETO_NETWORK_TESTS=1 to run"))
+@Suite(.tags(.network), .serialized, .enabled(if: NetworkTests.enabled, "set TEST_RUNNER_NETO_NETWORK_TESTS=1 to run"))
 struct LiveNetworkTests {
 
     private func whois(_ query: String) async -> WhoisResult {
@@ -29,8 +29,8 @@ struct LiveNetworkTests {
         }
     }
 
-    @Test(arguments: [("google.com", "whois.verisign-grs.com"),
-                      ("wikipedia.org", "whois.publicinterestregistry.org"),
+    @Test(arguments: [("google.com", "whois.markmonitor.com"),   // IANA → Verisign → MarkMonitor, like whois.c
+                      ("wikipedia.org", "whois.markmonitor.com"),   // PIR → MarkMonitor (registrar), like whois.c
                       ("denic.de", "whois.denic.de")])
     func domainReferral(domain: String, server: String) async {
         let result = await whois(domain)

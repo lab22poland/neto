@@ -57,7 +57,20 @@ final class WhoisManager {
     ]
     
     // MARK: - RIR Loop Detection (FreeBSD logic)
-    private var tryRir: [(loop: Bool, host: String)] = []
+    /// RIRs tried in turn when one asserts ignorance instead of referring (whois.c try_rir)
+    private var rirHosts: [String] { [anicHost, rnicHost, pnicHost, fnicHost, lnicHost] }
+
+    /// Lines with which an RIR says the address is not its own; whois.c then asks ARIN (actually_arin)
+    private let actuallyArin = [
+        "netname:        ERX-NETBLOCK\n", /* APNIC */
+        "netname:        NON-RIPE-NCC-MANAGED-ADDRESS-BLOCK\n"
+    ]
+
+    /// whois.c CHOPSPAM: Verisign and others append legal text after this line
+    private let chopSpam = ">>> Last update of WHOIS database:"
+
+    /// Safety limit for the referral chain (whois.c has none; registrars could refer to each other in a loop)
+    static let maxReferrals = 10
     
     /// Performs a WHOIS lookup for the specified query (domain, IP, AS number, etc.)
     /// - Parameters:
@@ -83,9 +96,6 @@ final class WhoisManager {
     ) async {
         let startTime = Date()
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Initialize RIR tracking (FreeBSD behavior)
-        resetRir()
         
         do {
             // Check if task was cancelled
@@ -121,44 +131,92 @@ final class WhoisManager {
         }
     }
     
-    /// Performs WHOIS lookup following FreeBSD logic with recursion
-    private func performFreeBSDWhoisLookup(query: String, startTime: Date, flags: Int = 1) async throws -> WhoisResult {
-        guard let chosenServer = chooseServer(for: query) else {
+    /// Performs the lookup like whois.c: query the chosen server, print its answer, follow the referral
+    /// (with RIR loop avoidance) until there is none, then report the last server's data
+    private func performFreeBSDWhoisLookup(query: String, startTime: Date) async throws -> WhoisResult {
+        guard var server = chooseServer(for: query) else {
             // whois.c choose_server(): errx(EX_SOFTWARE, "no default whois server")
             throw URLError(.badURL)
         }
-        let whoisData = try await queryWhoisServerFreeBSD(server: chosenServer, query: query)
+        var port = "43"
+        var visitedRIRs = Set<String>()
+        var output = ""
+        var lastServerOutput = ""
         
-        // Check for referrals if recursion is enabled (FreeBSD default behavior)
-        var finalData = whoisData
-        var finalServer = chosenServer
-        
-        if flags & 1 != 0 { // WHOIS_RECURSE equivalent
-            if let (referralHost, referralPort) = parseWhoisReferral(from: whoisData) {
-                if referralHost != chosenServer { // Avoid self-referrals
-                    finalData = try await queryWhoisServerFreeBSD(server: referralHost, query: query, port: referralPort)
-                    finalServer = referralHost
-                }
-            }
+        for _ in 0...Self.maxReferrals {
+            if Task.isCancelled { throw CancellationError() }
+            let canonicalName = await Self.canonicalName(of: server)
+            let response = try await queryWhoisServerFreeBSD(server: server, query: query, port: port, canonicalName: canonicalName)
+            let processed = processResponse(response, server: server)
+            output += processed.output
+            lastServerOutput = processed.output
+            
+            guard let next = nextServer(after: server, referral: processed.referral, visitedRIRs: &visitedRIRs),
+                  next.host.caseInsensitiveCompare(server) != .orderedSame else { break }   // whois.c ignores self-referrals
+            output += "# \(next.host)\n\n"
+            server = next.host
+            port = next.port
         }
         
         let endTime = Date()
         let responseTime = endTime.timeIntervalSince(startTime) * 1000
         
-        let parsedResult = parseWhoisResponse(finalData, for: query)
+        // Fields come from the most specific (last) server; the whole chain is shown as the raw response
+        let last = parseWhoisResponse(lastServerOutput, for: query)
+        let all = parseWhoisResponse(output, for: query)
         
         return WhoisResult(
             domain: query,
             success: true,
-            rawResponse: finalData,
-            registrar: parsedResult.registrar,
-            registrationDate: parsedResult.registrationDate,
-            expirationDate: parsedResult.expirationDate,
-            nameServers: parsedResult.nameServers,
-            whoisServer: finalServer,
+            rawResponse: output,
+            registrar: last.registrar ?? all.registrar,
+            registrationDate: last.registrationDate ?? all.registrationDate,
+            expirationDate: last.expirationDate ?? all.expirationDate,
+            nameServers: last.nameServers.isEmpty ? all.nameServers : last.nameServers,
+            whoisServer: server,
             statusMessage: "WHOIS lookup successful",
             responseTime: responseTime
         )
+    }
+    
+    /// whois.c after reading a server: remember visited RIRs; a referral to an RIR asked before is replaced by
+    /// the first RIR not asked yet. Returns the next server, or nil when the chain ends.
+    func nextServer(after server: String, referral: (host: String, port: String)?,
+                    visitedRIRs: inout Set<String>) -> (host: String, port: String)? {
+        var next = referral
+        var needAlternative = false
+        for rir in rirHosts {
+            if !visitedRIRs.contains(rir), rir.caseInsensitiveCompare(server) == .orderedSame {
+                visitedRIRs.insert(rir)
+            }
+            if visitedRIRs.contains(rir), let candidate = next, rir.caseInsensitiveCompare(candidate.host) == .orderedSame {
+                next = nil
+                needAlternative = true
+            }
+        }
+        if needAlternative, let unvisited = rirHosts.first(where: { !visitedRIRs.contains($0) }) {
+            next = (unvisited, "43")
+        }
+        return next
+    }
+    
+    /// Canonical name of a host (whois.c compares it with the Verisign host); nil if it cannot be resolved
+    static func canonicalName(of host: String) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var hints = addrinfo()
+                hints.ai_flags = AI_CANONNAME
+                hints.ai_family = AF_UNSPEC
+                hints.ai_socktype = SOCK_STREAM
+                var list: UnsafeMutablePointer<addrinfo>?
+                guard getaddrinfo(host, "43", &hints, &list) == 0, let list else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                defer { freeaddrinfo(list) }
+                continuation.resume(returning: list.pointee.ai_canonname.map { String(cString: $0) })
+            }
+        }
     }
     
     /// FreeBSD choose_server() function equivalent
@@ -178,7 +236,7 @@ final class WhoisManager {
     }
     
     /// RFC 3912 compliant WHOIS query with FreeBSD server-specific formatting
-    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43") async throws -> String {
+    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43", canonicalName: String? = nil) async throws -> String {
         return try await withCheckedThrowingContinuation { continuation in
             let connection = NWConnection(
                 host: NWEndpoint.Host(server),
@@ -192,7 +250,7 @@ final class WhoisManager {
                 switch state {
                 case .ready:
                     // FreeBSD server-specific query formatting
-                    let formattedQuery = self.formatQueryForServer(query: query, server: server)
+                    let formattedQuery = self.formatQueryForServer(query: query, server: server, canonicalName: canonicalName)
                     let requestData = formattedQuery.data(using: .utf8) ?? Data()
                     
                     connection.send(content: requestData, completion: .contentProcessed { error in
@@ -243,8 +301,9 @@ final class WhoisManager {
         }
     }
     
-    /// FreeBSD server-specific query formatting
-    func formatQueryForServer(query: String, server: String) -> String {
+    /// Server-specific query formatting, in whois.c order: DENIC, DK, queries with a space (sent as is), ARIN, Verisign
+    /// (recognised by the canonical name of the server, like whois.c's ai_canonname), default
+    func formatQueryForServer(query: String, server: String, canonicalName: String? = nil) -> String {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         
         // DENIC (German) special formatting
@@ -261,6 +320,11 @@ final class WhoisManager {
             return "--show-handles \(cleanQuery)\r\n"
         }
         
+        // A query with a space is sent unchanged (e.g. "AS 15169", "John Smith")
+        if cleanQuery.contains(" ") {
+            return "\(cleanQuery)\r\n"
+        }
+        
         // ARIN special formatting
         if server.caseInsensitiveCompare(anicHost) == .orderedSame {
             // AS number handling
@@ -275,7 +339,7 @@ final class WhoisManager {
         }
         
         // Verisign special formatting
-        if server.caseInsensitiveCompare(vnicHost) == .orderedSame {
+        if (canonicalName ?? server).caseInsensitiveCompare(vnicHost) == .orderedSame {
             return "domain \(cleanQuery)\r\n"
         }
         
@@ -320,63 +384,78 @@ final class WhoisManager {
         receiveNext()
     }
     
-    /// FreeBSD-style referral parsing
-    func parseWhoisReferral(from response: String) -> (host: String, port: String)? {
-        let lines = response.components(separatedBy: .newlines)
-        
-        for line in lines {
-            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            for (prefix, len) in whoisReferral {
-                if trimmedLine.count >= len && 
-                   String(trimmedLine.prefix(len)).caseInsensitiveCompare(prefix) == .orderedSame {
-                    
-                    let remainder = String(trimmedLine.dropFirst(len)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    
-                    // Parse host and optional port
-                    if let host = extractHostFromReferral(remainder) {
-                        let port = extractPortFromReferral(remainder) ?? "43"
-                        return (host, port)
-                    }
-                }
-            }
-        }
-        
-        return nil
+    /// What whois.c prints for one server's answer, and the referral it found
+    struct ProcessedResponse {
+        let output: String
+        let referral: (host: String, port: String)?
     }
     
-    /// Extract host from referral string (FreeBSD SCAN logic)
-    private func extractHostFromReferral(_ referral: String) -> String? {
-        var host = ""
-        for char in referral {
-            if char.isLetter || char.isNumber || char == "." || char == "-" {
-                host.append(char)
-            } else {
+    /// whois.c's read loop: stops at Nominet's "-- " line, skips ARIN/RIPE leading comments and stops at their
+    /// trailing comments, looks for the first referral, switches to ARIN on `actually_arin` lines, and cuts
+    /// Verisign-style legal text after the "Last update of WHOIS database" line.
+    func processResponse(_ response: String, server: String) -> ProcessedResponse {
+        var output = ""
+        var referral: (host: String, port: String)?
+        var comment = (server.caseInsensitiveCompare(anicHost) == .orderedSame ||
+                       server.caseInsensitiveCompare(rnicHost) == .orderedSame) ? 2 : 0
+        
+        // fgetln: lines keep their terminator
+        var lines = response.components(separatedBy: "\n").map { $0 + "\n" }
+        if response.hasSuffix("\n") || response.isEmpty { lines.removeLast() } else { lines[lines.count - 1].removeLast() }
+        
+        for line in lines {
+            if line == "-- \r\n" { break }                                  // Nominet
+            if comment == 1 && line.hasPrefix("#") { break }                // RIRs
+            if comment == 2 {
+                // whois.c: strchr("#%\r\n", buf[0]); in Swift "\r\n" is one Character, so check the first scalar
+                if let first = line.unicodeScalars.first, "#%\r\n".unicodeScalars.contains(first) { continue }
+                comment = 1
+            }
+            output += line
+            
+            if referral == nil {
+                referral = Self.referral(in: line, prefixes: whoisReferral.map(\.prefix))
+                if actuallyArin.contains(where: { $0.utf8.starts(with: line.utf8) }) {
+                    referral = (anicHost, "43")
+                }
+            }
+            if line.count >= chopSpam.count,
+               line.lowercased().hasPrefix(chopSpam.lowercased()) ||
+               line.lowercased().hasPrefix(String(chopSpam.dropFirst(4)).lowercased()) {
+                output += "\n"
                 break
             }
         }
-        return host.isEmpty ? nil : host
+        return ProcessedResponse(output: output, referral: referral)
     }
     
-    /// Extract port from referral string
-    private func extractPortFromReferral(_ referral: String) -> String? {
-        if let colonIndex = referral.firstIndex(of: ":") {
-            let portString = String(referral[referral.index(after: colonIndex)...])
-            let port = portString.prefix { $0.isNumber }
-            return port.isEmpty ? nil : String(port)
+    /// whois.c referral scan of one line: optional leading spaces, a known prefix (case-insensitive), spaces,
+    /// a host name, then an optional ":port" of 1-5 digits. A longer or empty port means no referral.
+    static func referral(in line: String, prefixes: [String]) -> (host: String, port: String)? {
+        let characters = Array(line)
+        var start = 0
+        while start < characters.count, characters[start] == " " { start += 1 }
+        let rest = String(characters[start...])
+        for prefix in prefixes {
+            guard rest.count >= prefix.count,
+                  String(rest.prefix(prefix.count)).caseInsensitiveCompare(prefix) == .orderedSame else { continue }
+            var index = start + prefix.count
+            while index < characters.count, characters[index] == " " { index += 1 }
+            let hostStart = index
+            while index < characters.count, characters[index].isASCII,
+                  characters[index].isLetter || characters[index].isNumber || characters[index] == "." || characters[index] == "-" {
+                index += 1
+            }
+            guard index > hostStart else { return nil }
+            let host = String(characters[hostStart..<index])
+            guard index < characters.count, characters[index] == ":" else { return (host, "43") }
+            index += 1
+            let portStart = index
+            while index < characters.count, characters[index].isASCII, characters[index].isNumber { index += 1 }
+            let digits = index - portStart
+            return digits > 0 && digits < 6 ? (host, String(characters[portStart..<index])) : nil   // invalid port: don't recurse
         }
         return nil
-    }
-    
-    /// Reset RIR tracking (FreeBSD reset_rir function)
-    private func resetRir() {
-        tryRir = [
-            (false, anicHost),
-            (false, rnicHost), 
-            (false, pnicHost),
-            (false, fnicHost),
-            (false, lnicHost)
-        ]
     }
     
     /// Enhanced WHOIS response parsing (more comprehensive than before)
