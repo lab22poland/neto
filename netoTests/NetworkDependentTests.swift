@@ -45,6 +45,26 @@ struct LiveNetworkTests {
         #expect(result.whoisServer == server)
     }
 
+    @Test @MainActor func tracerouteReachesPublicResolverThroughRouters() async {
+        let manager = TracerouteManager()
+        var hops: [Int: TracerouteResult] = [:]
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            _ = manager.performTraceroute(to: "8.8.8.8", maxHops: 30, timeout: 2,
+                                          onResult: { hops[$0.hopNumber] = $0 },
+                                          onComplete: { continuation.resume() })
+        }
+        let last = hops.keys.max().flatMap { hops[$0] }
+        #expect(last?.isDestination == true, "\(hops.values.sorted { $0.hopNumber < $1.hopNumber }.map(\.message))")
+        #expect(hops.count > 1, "8.8.8.8 is not on the local network, so routers must appear before it")
+        #expect(hops.values.contains { !$0.isDestination && $0.success }, "at least one router must answer Time Exceeded")
+    }
+
+    @Test func domainNameResolves() async throws {
+        let host = try await TracerouteManager().resolveHost("example.com")
+        #expect(host.family == AF_INET || host.family == AF_INET6)
+        #expect(!host.ipAddress.isEmpty)
+    }
+
     @Test @MainActor func pingPublicResolver() async {
         let manager = PingManager()
         var results: [PingResult] = []

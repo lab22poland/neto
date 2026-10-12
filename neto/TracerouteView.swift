@@ -42,7 +42,7 @@ struct TracerouteView: View {
                 .fontWeight(.bold)
                 .accessibilityIdentifier("traceroute.header")
             
-            Text("Discover the network path to a destination by probing intermediate hops")
+            Text("Discover the network path hop by hop with ICMP probes, like traceroute -I")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
@@ -128,6 +128,7 @@ struct TracerouteView: View {
                     }
                     .buttonStyle(.bordered)
                     .foregroundColor(.secondary)
+                    .accessibilityIdentifier("traceroute.stop")
                 }
                 
                 if !viewModel.tracerouteResults.isEmpty && !viewModel.isTracing {
@@ -187,6 +188,7 @@ struct TracerouteView: View {
                             Text("Destination reached")
                                 .foregroundColor(.primary)
                                 .font(.caption)
+                                .accessibilityIdentifier("traceroute.destination")
                         }
                     } else if viewModel.isTracing {
                         HStack {
@@ -256,11 +258,11 @@ struct TracerouteResultRow: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(result.success ? .primary : .secondary)
                 
-                // Response time (if successful)
-                if result.success && result.responseTime > 0 {
-                    Text(String(format: "%.2f ms", result.responseTime))
+                // Round-trip time of each probe ("*" = no reply)
+                if !result.probeTimes.isEmpty {
+                    Text(result.formattedProbeTimes)
                         .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(.primary)
+                        .foregroundColor(result.success ? .primary : .secondary)
                 }
             }
             
