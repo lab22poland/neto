@@ -156,25 +156,60 @@ final class PingManager: NSObject {
             // Expire anything overdue so results keep their order.
             expireTimedOutPings()
             if i < config.count - 1 {
-                do { try await Task.sleep(nanoseconds: UInt64(config.interval * 1_000_000_000)) } catch { return }
+                guard await wait(until: sentAt + Self.nanoseconds(config.interval), stopWhenAllReceived: false) else { return }
             }
         }
         await waitForCompletion(lastSentAt: lastSentAt)
     }
     
-    /// Waits after the last send like ping: until every transmitted packet is answered (late replies included),
-    /// but at most one interval plus the timeout (ping waits its interval, then its -W wait time, then exits).
+    /// How long ping waits for stragglers after the interval that follows its last send
+    /// (Apple network_cmds ping.c main loop, `almost_done`): 2 × the longest RTT, truncated to whole seconds
+    /// and at least 1 s, if anything was received; otherwise the per-packet wait time (-W).
+    /// - Parameters:
+    ///   - received: Replies received so far
+    ///   - maxRoundTripTime: Longest RTT so far in milliseconds (late replies included, as ping's tmax)
+    ///   - timeout: Per-packet timeout in seconds
+    /// - Returns: The wait in seconds
+    static func finalWait(received: Int, maxRoundTripTime: Double, timeout: TimeInterval) -> TimeInterval {
+        guard received > 0 else { return timeout }
+        let seconds = Int(2 * maxRoundTripTime / 1000)   // ping assigns the double to tv_sec
+        return TimeInterval(max(seconds, 1))
+    }
+    
+    private static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        UInt64(max(seconds, 0) * 1_000_000_000)
+    }
+    
+    /// Waits after the last send like ping: one more interval, then `finalWait`; it ends as soon as
+    /// `count` replies have arrived (late ones included), like ping's `nreceived >= npackets` exit.
     @MainActor
     private func waitForCompletion(lastSentAt: UInt64) async {
-        let deadline = lastSentAt + UInt64((currentConfig.interval + currentConfig.timeout) * 1_000_000_000)
-        while !Task.isCancelled,
-              packets.values.contains(where: { $0.state == .pending || $0.state == .timedOut }),
-              SimplePing.now() < deadline {
+        guard await wait(until: lastSentAt + Self.nanoseconds(currentConfig.interval), stopWhenAllReceived: true),
+              !allReceived else { return }
+        let linger = Self.finalWait(received: statistics?.received ?? 0,
+                                    maxRoundTripTime: statistics?.maxResponseTime ?? 0,
+                                    timeout: currentConfig.timeout)
+        _ = await wait(until: SimplePing.now() + Self.nanoseconds(linger), stopWhenAllReceived: true)
+    }
+    
+    /// Every packet of the run has been answered, or the socket failed and nothing more can arrive
+    @MainActor
+    private var allReceived: Bool {
+        runtimeError != nil || (statistics?.received ?? 0) >= currentConfig.count
+    }
+    
+    /// Sleeps until `deadline` (SimplePing.now() nanoseconds) in steps of at most 10 ms and shows timeouts
+    /// as soon as they are due, so a "Request timeout" row is not held back until the next send.
+    /// - Returns: false if the run was cancelled
+    @MainActor
+    private func wait(until deadline: UInt64, stopWhenAllReceived: Bool) async -> Bool {
+        while true {
+            if Task.isCancelled { return false }
             expireTimedOutPings()
-            try? await Task.sleep(nanoseconds: 10_000_000)
+            let now = SimplePing.now()
+            if now >= deadline || (stopWhenAllReceived && allReceived) { return true }
+            do { try await Task.sleep(nanoseconds: min(deadline - now, 10_000_000)) } catch { return false }
         }
-        // Packets that are still pending past the deadline get their timeout row now
-        if !Task.isCancelled { expireTimedOutPings() }
     }
     
     @MainActor
@@ -245,6 +280,9 @@ extension PingManager: SimplePing.Delegate {
     func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {
         MainActor.assumeIsolated {
             if startContinuation != nil { resumeStart(with: error); return }
+            // Deliberate divergence from ping: on a hard receive error (e.g. EPERM in the sandbox) ping only warns
+            // ("recvmsg: ...") and keeps going; SimplePing stops reading instead of spinning on the read source,
+            // so outstanding packets fail now and the run ends without the final wait.
             runtimeError = error
             // Fail outstanding pings right away (in order) instead of letting them time out later.
             for seq in packets.keys.sorted(by: { packets[$0]!.display < packets[$1]!.display }) {

@@ -242,6 +242,7 @@ final class SimplePing: NSObject {
                     }
                 }
                 // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source.
+                // ping(8) only warns about a recvmsg error and keeps reading; this divergence is deliberate.
                 if let error {
                     source.cancel()
                     self.readSource = nil

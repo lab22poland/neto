@@ -119,6 +119,25 @@ final class PingManagerTests: XCTestCase {
         XCTAssertEqual(statistics.last?.late, 0)
     }
 
+    /// With interval > timeout the timeout row must not wait for the next send
+    func testTimeoutRowIsDeliveredWithoutWaitingForNextSend() {
+        let manager = PingManager()
+        var firstTimeoutAfter: TimeInterval?
+        let start = Date()
+        let timedOut = expectation(description: "timeout row")
+        _ = manager.performPing(to: "192.0.2.1", config: .init(count: 2, interval: 3, timeout: 0.3, payloadSize: 56),
+                                onResult: { result in
+                                    guard firstTimeoutAfter == nil else { return }
+                                    firstTimeoutAfter = Date().timeIntervalSince(start)
+                                    timedOut.fulfill()
+                                },
+                                onComplete: {})
+        wait(for: [timedOut], timeout: 5)
+        manager.stopPing()
+        // Either a timeout (TEST-NET never answers) or a send error without a route; both well before the 3 s interval
+        XCTAssertLessThan(firstTimeoutAfter ?? 99, 1.5)
+    }
+
     /// Every loopback reply takes longer than 1 µs: whether the expiry or the reply is processed first,
     /// the rows are timeouts and the replies still count as received (like `ping -W`)
     func testLateRepliesAreTimeoutRowsButCountAsReceived() {
@@ -241,6 +260,20 @@ struct PingStatisticsTests {
         #expect(statistics.minResponseTime == 10)
         #expect(statistics.maxResponseTime == 50)
         #expect(statistics.avgResponseTime == 30)
+    }
+
+    /// ping.c: 2 * tmax truncated to whole seconds, at least 1 s, if anything was received; else the wait time
+    @Test(arguments: [
+        (0, 0.0, 5.0, 5.0),
+        (0, 0.0, 0.3, 0.3),
+        (3, 35.0, 5.0, 1.0),
+        (3, 499.0, 5.0, 1.0),
+        (3, 600.0, 5.0, 1.0),     // 1.2 s truncated
+        (3, 1000.0, 5.0, 2.0),
+        (1, 2600.0, 2.0, 5.0),    // a late reply raises tmax too
+    ])
+    func finalWaitLikePing(received: Int, maxRoundTripTime: Double, timeout: Double, wait: Double) {
+        #expect(PingManager.finalWait(received: received, maxRoundTripTime: maxRoundTripTime, timeout: timeout) == wait)
     }
 
     @Test func nothingTransmittedIsNoLoss() {
