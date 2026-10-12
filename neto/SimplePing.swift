@@ -31,7 +31,10 @@ final class SimplePing: NSObject {
         func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error)
         
         /// Called when an echo response is received
-        func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16)
+        /// - Parameters:
+        ///   - address: The sender's socket address (sockaddr_in / sockaddr_in6) as returned by recvmsg
+        ///   - receivedAt: Receive time on the `SimplePing.now()` clock (kernel timestamp when available)
+        func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16, from address: Data, receivedAt: UInt64)
         
         /// Called when an unexpected packet is received
         func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data)
@@ -49,6 +52,8 @@ final class SimplePing: NSObject {
     private var readSource: DispatchSourceRead?
     private var addressFamily: Int32 = AF_INET
     private var nextSequenceNumber: UInt16 = 0
+    /// Serial queue that reads the socket and timestamps replies, so main-queue latency does not add to the RTT
+    private let readQueue = DispatchQueue(label: "pl.lab22.neto.ping.read", qos: .userInitiated)
     
     // MARK: - Initialization
     
@@ -66,6 +71,23 @@ final class SimplePing: NSObject {
     
     /// The host name being pinged
     var targetHostName: String { return self.hostName }
+    
+    /// Monotonic time in nanoseconds (mach_absolute_time, the clock of SO_TIMESTAMP_MONOTONIC); use it for send times
+    static func now() -> UInt64 {
+        nanoseconds(fromMachTime: mach_absolute_time())
+    }
+    
+    private static let timebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+    
+    /// Converts mach_absolute_time ticks to nanoseconds
+    static func nanoseconds(fromMachTime ticks: UInt64) -> UInt64 {
+        let numer = UInt64(timebase.numer), denom = UInt64(timebase.denom)
+        return ticks / denom * numer + ticks % denom * numer / denom
+    }
     
     deinit {
         stop()
@@ -185,17 +207,48 @@ final class SimplePing: NSObject {
         
         let flags = fcntl(socket, F_GETFL)
         _ = fcntl(socket, F_SETFL, flags | O_NONBLOCK)
+        // Kernel receive timestamps on the monotonic clock (verified on macOS for SOCK_DGRAM ICMP);
+        // if the option is refused, readReplies falls back to the time the packet is read.
+        var on: Int32 = 1
+        _ = setsockopt(socket, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &on, socklen_t(MemoryLayout<Int32>.size))
         
         startReceiving()
         delegate?.simplePing(self, didStartWithAddress: hostAddress)
     }
     
-    /// Starts receiving ICMP responses using a dispatch read source on the main queue
+    /// Starts receiving ICMP responses using a dispatch read source on a background queue;
+    /// delegate callbacks are still delivered on the main queue
     private func startReceiving() {
         let fd = socket
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        let family = addressFamily
+        let identifier = identifier
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
+        var failed = false   // touched only on readQueue
         source.setEventHandler { [weak self] in
-            self?.readData(fd: fd)
+            guard !failed else { return }
+            let (replies, error) = Self.readReplies(fd: fd, family: family, identifier: identifier)
+            if error != nil { failed = true }
+            guard !replies.isEmpty || error != nil else { return }
+            DispatchQueue.main.async {
+                // Nothing is delivered once the pinger has been stopped
+                guard let self, self.readSource === source else { return }
+                for reply in replies {
+                    guard self.readSource === source else { return }
+                    if let sequenceNumber = reply.sequenceNumber {
+                        self.delegate?.simplePing(self, didReceivePingResponsePacket: reply.packet, sequenceNumber: sequenceNumber,
+                                                  from: reply.address, receivedAt: reply.receivedAt)
+                    } else {
+                        self.delegate?.simplePing(self, didReceiveUnexpectedPacket: reply.packet)
+                    }
+                }
+                // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source.
+                if let error {
+                    source.cancel()
+                    self.readSource = nil
+                    self.socket = -1
+                    self.delegate?.simplePing(self, didFailWithError: error)
+                }
+            }
         }
         source.setCancelHandler {
             close(fd)
@@ -204,32 +257,75 @@ final class SimplePing: NSObject {
         source.resume()
     }
     
-    private func readData(fd: Int32) {
+    /// A packet read from the socket with its sender and receive time
+    private struct ReceivedPacket {
+        let packet: Data
+        let address: Data
+        let receivedAt: UInt64
+        /// Set if the packet is an echo reply to our identifier
+        let sequenceNumber: UInt16?
+    }
+    
+    /// Drains the socket with recvmsg (runs on `readQueue`). Returns the packets read so far and a hard error, if any.
+    private static func readReplies(fd: Int32, family: Int32, identifier: UInt16) -> ([ReceivedPacket], Error?) {
+        var packets: [ReceivedPacket] = []
         var buffer = [UInt8](repeating: 0, count: 65535)
+        var control = [UInt8](repeating: 0, count: 128)
+        var from = sockaddr_storage()
         while true {
-            let bytesRead = recv(fd, &buffer, buffer.count, 0)
+            var kernelTime: UInt64?
+            var fromLength = socklen_t(0)
+            let bytesRead: Int = buffer.withUnsafeMutableBytes { bufferBytes in
+                control.withUnsafeMutableBytes { controlBytes in
+                    withUnsafeMutablePointer(to: &from) { fromPointer in
+                        var iov = iovec(iov_base: bufferBytes.baseAddress, iov_len: bufferBytes.count)
+                        return withUnsafeMutablePointer(to: &iov) { iovPointer in
+                            var message = msghdr()
+                            message.msg_name = UnsafeMutableRawPointer(fromPointer)
+                            message.msg_namelen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+                            message.msg_iov = iovPointer
+                            message.msg_iovlen = 1
+                            message.msg_control = controlBytes.baseAddress
+                            message.msg_controllen = socklen_t(controlBytes.count)
+                            let count = recvmsg(fd, &message, 0)
+                            guard count >= 0 else { return count }
+                            fromLength = message.msg_namelen
+                            kernelTime = monotonicTimestamp(in: UnsafeRawBufferPointer(rebasing: controlBytes[..<Int(message.msg_controllen)]))
+                            return count
+                        }
+                    }
+                }
+            }
             if bytesRead < 0 {
                 let err = errno
-                if err == EAGAIN || err == EWOULDBLOCK || err == EINTR { return }
-                // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source.
-                readSource?.cancel()
-                readSource = nil
-                socket = -1
-                delegate?.simplePing(self, didFailWithError: POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
-                return
+                if err == EAGAIN || err == EWOULDBLOCK || err == EINTR { return (packets, nil) }
+                return (packets, POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
             }
-            guard bytesRead > 0 else { return }
-            processReceivedPacket(Data(buffer[0..<bytesRead]))
+            guard bytesRead > 0 else { return (packets, nil) }
+            let receivedAt = kernelTime.map { nanoseconds(fromMachTime: $0) } ?? now()
+            let packet = Data(buffer[0..<bytesRead])
+            let address = withUnsafeBytes(of: &from) { Data($0.prefix(Int(fromLength))) }
+            packets.append(ReceivedPacket(packet: packet, address: address, receivedAt: receivedAt,
+                                          sequenceNumber: ICMPPacket.echoReplySequenceNumber(in: packet, family: family, identifier: identifier)))
         }
     }
     
-    /// Processes a received ICMP packet (always called on the main queue)
-    private func processReceivedPacket(_ packetData: Data) {
-        if let sequenceNumber = ICMPPacket.echoReplySequenceNumber(in: packetData, family: addressFamily, identifier: identifier) {
-            delegate?.simplePing(self, didReceivePingResponsePacket: packetData, sequenceNumber: sequenceNumber)
-        } else {
-            delegate?.simplePing(self, didReceiveUnexpectedPacket: packetData)
+    /// The SCM_TIMESTAMP_MONOTONIC value (mach_absolute_time ticks) from a recvmsg control buffer, or nil
+    private static func monotonicTimestamp(in control: UnsafeRawBufferPointer) -> UInt64? {
+        let headerSize = MemoryLayout<cmsghdr>.size
+        let align = { (length: Int) in (length + 3) & ~3 }   // __DARWIN_ALIGN32
+        var offset = 0
+        while offset + headerSize <= control.count {
+            let header = control.loadUnaligned(fromByteOffset: offset, as: cmsghdr.self)
+            guard header.cmsg_len >= headerSize, offset + Int(header.cmsg_len) <= control.count else { return nil }
+            let dataOffset = offset + align(headerSize)
+            if header.cmsg_level == SOL_SOCKET, header.cmsg_type == SCM_TIMESTAMP_MONOTONIC,
+               dataOffset + MemoryLayout<UInt64>.size <= control.count {
+                return control.loadUnaligned(fromByteOffset: dataOffset, as: UInt64.self)
+            }
+            offset += align(Int(header.cmsg_len))
         }
+        return nil
     }
     
     /// Creates an ICMP echo request packet

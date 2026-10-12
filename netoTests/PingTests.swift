@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import Testing
 @testable import neto
 
 /// Real ICMP over the loopback interface (no internet needed)
@@ -16,16 +17,19 @@ final class SimplePingLoopbackTests: XCTestCase {
     private final class Recorder: NSObject, SimplePing.Delegate {
         var onStart: (() -> Void)?
         var onFail: ((Error) -> Void)?
-        var onReply: ((UInt16) -> Void)?
+        var onReply: ((UInt16, String?) -> Void)?
         func simplePing(_ pinger: SimplePing, didStartWithAddress address: Data) { onStart?() }
         func simplePing(_ pinger: SimplePing, didFailWithError error: Error) { onFail?(error) }
         func simplePing(_ pinger: SimplePing, didSendPacket packet: Data, sequenceNumber: UInt16) {}
         func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error) {}
-        func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16) { onReply?(sequenceNumber) }
+        func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16,
+                        from address: Data, receivedAt: UInt64) {
+            onReply?(sequenceNumber, TracerouteManager.numericHost(address))
+        }
         func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data) {}
     }
 
-    /// Sends one echo request and expects the reply with the same sequence number
+    /// Sends one echo request and expects the reply with the same sequence number from the target address
     private func assertEchoRoundTrip(host: String) {
         let recorder = Recorder()
         let pinger = SimplePing(hostName: host, identifier: UInt16.random(in: 1...UInt16.max), delegate: recorder)
@@ -33,8 +37,9 @@ final class SimplePingLoopbackTests: XCTestCase {
         var sentSequence: UInt16?
         recorder.onStart = { sentSequence = pinger.sendPingWithPayload(Data(repeating: 0xA5, count: 32)) }
         recorder.onFail = { XCTFail("\(host): \($0)") }
-        recorder.onReply = { sequence in
+        recorder.onReply = { sequence, sender in
             XCTAssertEqual(sequence, sentSequence)
+            XCTAssertEqual(sender, host, "the sender address comes from recvmsg")
             replied.fulfill()
         }
         pinger.start()
@@ -92,7 +97,47 @@ final class PingManagerTests: XCTestCase {
         XCTAssertEqual(run.completions, 1)
         XCTAssertEqual(run.results.map(\.sequenceNumber), [1, 2, 3])
         XCTAssertTrue(run.results.allSatisfy(\.success), run.results.map(\.message).joined(separator: "; "))
-        XCTAssertTrue(run.results.allSatisfy { $0.message.hasPrefix("Reply from 127.0.0.1") })
+        XCTAssertTrue(run.results.allSatisfy { $0.message.hasPrefix("Reply from 127.0.0.1:") })
+    }
+
+    func testStatisticsCountTransmittedAndReceived() {
+        var statistics: [PingStatistics] = []
+        let completed = expectation(description: "completed")
+        let manager = PingManager()
+        _ = manager.performPing(to: "localhost", config: fast,
+                                      onResult: { _ in },
+                                      onStatistics: { statistics.append($0) },
+                                      onComplete: { completed.fulfill() })
+        waitForCompletion(completed)
+
+        let first = statistics.first
+        XCTAssertEqual(first?.transmitted, 0, "the first update comes with the resolved address, before any send")
+        XCTAssertTrue(["127.0.0.1", "::1"].contains(first?.address ?? ""), "resolved address: \(first?.address ?? "nil")")
+        XCTAssertEqual(first?.host, "localhost")
+        XCTAssertEqual(statistics.last?.transmitted, 3)
+        XCTAssertEqual(statistics.last?.received, 3)
+        XCTAssertEqual(statistics.last?.late, 0)
+    }
+
+    /// Every loopback reply takes longer than 1 µs: whether the expiry or the reply is processed first,
+    /// the rows are timeouts and the replies still count as received (like `ping -W`)
+    func testLateRepliesAreTimeoutRowsButCountAsReceived() {
+        var run = Run()
+        var statistics: PingStatistics?
+        let completed = expectation(description: "completed")
+        let manager = PingManager()
+        _ = manager.performPing(to: "127.0.0.1", config: .init(count: 3, interval: 0.2, timeout: 0.000_001, payloadSize: 56),
+                                      onResult: { run.results.append($0) },
+                                      onStatistics: { statistics = $0 },
+                                      onComplete: { completed.fulfill() })
+        waitForCompletion(completed)
+
+        XCTAssertEqual(run.results.map(\.kind), [.timeout, .timeout, .timeout], run.results.map(\.message).joined(separator: "; "))
+        XCTAssertEqual(statistics?.transmitted, 3)
+        // A reply still in flight when the run ends is lost, as in ping; on loopback all three arrive in time
+        XCTAssertEqual(statistics?.received, 3)
+        XCTAssertEqual(statistics?.late, 3)
+        XCTAssertEqual(statistics?.packetLoss, 0)
     }
 
     func testStopEndsRunOnceWithoutFurtherResults() {
@@ -179,25 +224,50 @@ final class PingManagerTests: XCTestCase {
     }
 }
 
-/// Statistics shown under the ping results
-@MainActor
-final class PingStatisticsTests: XCTestCase {
+/// Statistics with ping's semantics: transmitted = send attempts, loss = (transmitted - received) / transmitted
+struct PingStatisticsTests {
 
-    private func result(_ sequence: Int, success: Bool, time: Double = 0, message: String = "") -> PingResult {
-        PingResult(id: UUID(), sequenceNumber: sequence, success: success, responseTime: time, message: message)
+    @Test func lossAndTimesFromRepliesIncludingLateOnes() {
+        var statistics = PingStatistics(host: "example.com", address: "192.0.2.1")
+        for _ in 0..<4 { statistics.recordTransmitted() }
+        statistics.recordReply(roundTripTime: 10, late: false)
+        statistics.recordReply(roundTripTime: 50, late: true)
+        statistics.recordReply(roundTripTime: 30, late: false)
+
+        #expect(statistics.received == 3)
+        #expect(statistics.late == 1)
+        #expect(statistics.packetLoss == 25)
+        #expect(statistics.formattedPacketLoss == "25.0%")
+        #expect(statistics.minResponseTime == 10)
+        #expect(statistics.maxResponseTime == 50)
+        #expect(statistics.avgResponseTime == 30)
     }
 
-    func testStatisticsFromReplies() {
-        let viewModel = PingViewModel()
-        viewModel.pingResults = [result(1, success: true, time: 10), result(2, success: false), result(3, success: true, time: 30)]
-        let stats = viewModel.pingStatistics
+    @Test func nothingTransmittedIsNoLoss() {
+        let statistics = PingStatistics(host: "localhost", address: "127.0.0.1")
+        #expect(statistics.packetLoss == 0)
+        #expect(statistics.avgResponseTime == 0)
+    }
 
-        XCTAssertEqual(stats.totalPings, 3)
-        XCTAssertEqual(stats.successCount, 2)
-        XCTAssertEqual(stats.packetLoss, 100.0 / 3, accuracy: 0.001)
-        XCTAssertEqual(stats.minResponseTime, 10)
-        XCTAssertEqual(stats.maxResponseTime, 30)
-        XCTAssertEqual(stats.avgResponseTime, 20)
+    @Test(arguments: [
+        (0.004, 0.005, false),
+        (0.005, 0.005, false),   // ping: late only if triptime > waittime
+        (0.0051, 0.005, true),
+        (0.012, 0.005, true),
+        (2.5, 5.0, false),
+    ])
+    func lateRule(roundTripTime: Double, timeout: Double, late: Bool) {
+        #expect(PingManager.isLate(roundTripTime: roundTripTime, timeout: timeout) == late)
+    }
+}
+
+/// View model accounting: failed start, stop, clear
+@MainActor
+final class PingViewModelTests: XCTestCase {
+
+    private func waitUntilIdle(_ viewModel: PingViewModel, timeout: TimeInterval) {
+        let done = expectation(for: NSPredicate { _, _ in !viewModel.isPinging }, evaluatedWith: nil)
+        wait(for: [done], timeout: timeout)
     }
 
     func testEmptyHostIsRejected() {
@@ -209,13 +279,59 @@ final class PingStatisticsTests: XCTestCase {
         XCTAssertNotNil(viewModel.errorMessage)
     }
 
-    func testStopMarkerDoesNotCountAsLostPacket() {
+    /// A host that does not resolve is an error, not a run with "1 sent, 100% loss"
+    func testFailedStartShowsErrorWithoutStatistics() {
         let viewModel = PingViewModel()
-        viewModel.pingResults = [result(1, success: true, time: 1), result(2, success: true, time: 1)]
-        viewModel.isPinging = true
+        viewModel.targetHost = "a..b"   // an invalid name fails in getaddrinfo without a DNS query
+        viewModel.startPing()
+        waitUntilIdle(viewModel, timeout: 10)
+
+        XCTAssertTrue(viewModel.errorMessage?.hasPrefix("Failed to start ping") == true, viewModel.errorMessage ?? "nil")
+        XCTAssertTrue(viewModel.pingResults.isEmpty)
+        XCTAssertNil(viewModel.statistics)
+    }
+
+    /// Packets in flight at Stop count as transmitted and lost, like ping's Ctrl-C summary
+    func testStopKeepsUnansweredPacketsAsLost() {
+        let viewModel = PingViewModel()
+        viewModel.targetHost = "192.0.2.1"   // TEST-NET-1: never answers (or sendto fails without a route; both count as sent)
+        viewModel.pingCount = 10
+        viewModel.pingInterval = 0.2
+        viewModel.pingTimeout = 5
+        viewModel.startPing()
+        let sent = expectation(for: NSPredicate { _, _ in (viewModel.statistics?.transmitted ?? 0) >= 2 }, evaluatedWith: nil)
+        wait(for: [sent], timeout: 10)
+        viewModel.stopPing()
+        let transmitted = viewModel.statistics?.transmitted ?? 0
+        let settle = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { settle.fulfill() }
+        wait(for: [settle], timeout: 2)
+
+        XCTAssertFalse(viewModel.isPinging)
+        XCTAssertGreaterThanOrEqual(transmitted, 2)
+        XCTAssertEqual(viewModel.statistics?.transmitted, transmitted, "nothing changes after stop")
+        XCTAssertEqual(viewModel.statistics?.received, 0)
+        XCTAssertEqual(viewModel.statistics?.packetLoss, 100)
+        XCTAssertEqual(viewModel.pingResults.last?.kind, .stopped)
+        XCTAssertEqual(viewModel.pingResults.filter { $0.kind == .stopped }.count, 1)
+    }
+
+    func testStopAfterRepliesKeepsStatisticsAndClearRemovesThem() {
+        let viewModel = PingViewModel()
+        viewModel.targetHost = "127.0.0.1"
+        viewModel.pingCount = 20
+        viewModel.pingInterval = 0.2
+        viewModel.startPing()
+        let replied = expectation(for: NSPredicate { _, _ in (viewModel.statistics?.received ?? 0) >= 2 }, evaluatedWith: nil)
+        wait(for: [replied], timeout: 10)
         viewModel.stopPing()
 
-        XCTAssertEqual(viewModel.pingStatistics.totalPings, 2)
-        XCTAssertEqual(viewModel.pingStatistics.packetLoss, 0)
+        let statistics = viewModel.statistics
+        XCTAssertEqual(statistics?.address, "127.0.0.1")
+        XCTAssertEqual(viewModel.pingResults.filter(\.success).count, statistics?.received)
+        XCTAssertLessThanOrEqual(statistics?.received ?? 0, statistics?.transmitted ?? 0)
+        viewModel.clearResults()
+        XCTAssertTrue(viewModel.pingResults.isEmpty)
+        XCTAssertNil(viewModel.statistics)
     }
 }
