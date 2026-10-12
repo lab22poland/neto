@@ -10,7 +10,7 @@ import Foundation
 import Testing
 @testable import neto
 
-/// Grouping and `arp -an`-style output of ARP entries
+/// Grouping and ordering of ARP entries
 struct ArpResultTests {
 
     private func entry(_ ip: String, _ interface: String, status: String = "expires in 2m0s") -> ArpEntry {
@@ -23,29 +23,23 @@ struct ArpResultTests {
         #expect(result.entriesByInterface["en1"]?.count == 2)
     }
 
-    @Test func commandLineFormatMatchesArp() {
-        #expect(entry("10.0.0.1", "en0", status: "permanent").commandLineFormat
-                == "? (10.0.0.1) at aa:bb:cc:dd:ee:ff on en0 ifscope permanent [ethernet]")
-        var bridged = entry("192.168.64.12", "bridge100")
-        bridged.linkType = "bridge"
-        #expect(bridged.commandLineFormat == "? (192.168.64.12) at aa:bb:cc:dd:ee:ff on bridge100 ifscope [bridge]")
-    }
-
-    @Test func outputIsSortedNumerically() {
-        let output = ArpResult(entries: [entry("fe80::1", "en0"), entry("10.0.0.10", "en0"), entry("10.0.0.2", "en0")]).commandLineOutput
-        #expect(output.components(separatedBy: "\n").map { $0.components(separatedBy: " ")[1] } == ["(10.0.0.2)", "(10.0.0.10)", "(fe80::1)"])
+    @Test func entriesAreSortedNumerically() {
+        let result = ArpResult(entries: [entry("fe80::1", "en0"), entry("10.0.0.10", "en0"), entry("10.0.0.2", "en1"), entry("10.0.0.2", "en0")])
+        #expect(result.allEntries.map { "\($0.ipAddress)%\($0.interface)" } == ["10.0.0.2%en0", "10.0.0.2%en1", "10.0.0.10%en0", "fe80::1%en0"])
+        #expect(result.entriesByInterface["en0"]?.map(\.ipAddress) == ["10.0.0.2", "10.0.0.10", "fe80::1"])
     }
 }
 
 #if os(macOS)
 /// Parsing of the routing-table dump, using records captured from a real Mac (`sysctl(NET_RT_FLAGS, RTF_LLINFO)`).
-/// Expected values were checked against `arp -an` / `ndp -an` on the same machine at the same time.
+/// Expected values were checked against `arp -an` / `ndp -an` on the same machine at the same time
+/// (the app prints MACs zero-padded, `arp` does not).
 struct ArpNeighborTableParsingTests {
 
     private static let now = 1_791_786_736
     private static let interfaces = [1: "lo0", 13: "en0", 28: "bridge100"]
 
-    private func parse(_ hex: [String], neighborInfo: @escaping (String, String) -> ArpManager.NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
+    private func bytes(_ hex: [String]) -> [UInt8] {
         let joined = hex.joined()
         var bytes: [UInt8] = []
         var index = joined.startIndex
@@ -54,7 +48,15 @@ struct ArpNeighborTableParsingTests {
             bytes.append(UInt8(joined[index..<next], radix: 16)!)
             index = next
         }
-        return ArpManager.parseNeighborTable(bytes, now: Self.now, interfaceName: { Self.interfaces[$0] ?? "if\($0)" }, neighborInfo: neighborInfo)
+        return bytes
+    }
+
+    private func parse(_ records: [UInt8], neighborInfo: @escaping (String, Int) -> ArpManager.NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
+        ArpManager.parseNeighborTable(records, now: Self.now, interfaceName: { Self.interfaces[$0] ?? "if\($0)" }, neighborInfo: neighborInfo)
+    }
+
+    private func parse(_ hex: [String], neighborInfo: @escaping (String, Int) -> ArpManager.NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
+        parse(bytes(hex), neighborInfo: neighborInfo)
     }
 
     /// 192.168.64.1 (bridge, permanent), 192.168.64.12 (bridge, dynamic), 224.0.0.251 (en0, multicast)
@@ -82,13 +84,20 @@ struct ArpNeighborTableParsingTests {
     ]
 
     @Test func ipv4EntriesMatchArp() {
+        // arp -an: "? (192.168.64.1) at c2:c7:db:db:7f:64 on bridge100 ifscope permanent [bridge]" etc.
         let entries = parse(ipv4Records)
-        #expect(entries.map(\.commandLineFormat) == [
-            "? (192.168.64.1) at c2:c7:db:db:7f:64 on bridge100 ifscope permanent [bridge]",
-            "? (192.168.64.12) at 9a:bf:7c:ad:e8:7f on bridge100 ifscope [bridge]",
-            "? (224.0.0.251) at 01:00:5e:00:00:fb on en0 ifscope permanent [ethernet]",
-        ])
-        #expect(entries[1].status == "expires in 16m53s")
+        #expect(entries.map(\.ipAddress) == ["192.168.64.1", "192.168.64.12", "224.0.0.251"])
+        #expect(entries.map(\.macAddress) == ["c2:c7:db:db:7f:64", "9a:bf:7c:ad:e8:7f", "01:00:5e:00:00:fb"])
+        #expect(entries.map(\.interface) == ["bridge100", "bridge100", "en0"])
+        #expect(entries.map(\.status) == ["permanent", "expires in 16m53s", "permanent"])
+        #expect(entries.map(\.linkType) == ["bridge", "bridge", "ethernet"])
+        #expect(entries.filter { !$0.isScoped }.isEmpty)
+    }
+
+    @Test func unscopedEntry() {
+        var records = bytes(ipv4Records)
+        records[11] &= ~0x01   // clear RTF_IFSCOPE (0x01000000, little-endian rtm_flags at offset 8) in the first record
+        #expect(parse(records).first?.isScoped == false)
     }
 
     @Test func ipv6EntriesMatchNdp() {
@@ -96,15 +105,33 @@ struct ArpNeighborTableParsingTests {
         #expect(entries.map(\.ipAddress) == ["fe80::101", "fe80::1"], "the embedded scope must be cleared")
         #expect(entries.map(\.macAddress) == ["6c:b7:e2:93:66:eb", "(incomplete)"])
         #expect(entries.map(\.interface) == ["en0", "lo0"])
+        #expect(entries.map(\.status) == ["unknown", "unknown"], "without neighbor info the IPv6 state is unknown, not permanent")
+    }
+
+    @Test func ipv6MulticastIsSkipped() {
+        var records = bytes(ipv6Records)
+        records[92 + 8] = 0xff   // turn the first destination into a multicast address (ff..)
+        #expect(parse(records).map(\.ipAddress) == ["fe80::1"])
     }
 
     @Test func ipv6StateAndExpiryComeFromNeighborDiscovery() {
         let entries = parse(ipv6Records) { address, interface in
-            address == "fe80::101" && interface == "en0"
+            address == "fe80::101" && interface == 13
                 ? ArpManager.NeighborInfo(state: 2, expire: Self.now + 86_379)
                 : ArpManager.NeighborInfo(state: 1, expire: 0)
         }
         #expect(entries.map(\.status) == ["stale, expires in 23h59m39s", "reachable, permanent"])
+    }
+
+    @Test(arguments: [(UInt8(IFT_ETHER), "ethernet"), (UInt8(IFT_BRIDGE), "bridge"), (UInt8(IFT_L2VLAN), "vlan"),
+                      (UInt8(IFT_LOOP), ""), (UInt8(IFT_OTHER), "")])
+    func linkTypeNamesFollowArp(type: UInt8, name: String) {
+        #expect(ArpManager.linkTypeName(type) == name)
+    }
+
+    @Test(arguments: [(44, "44s"), (3_604, "1h0m4s"), (86_379, "23h59m39s"), (86_405, "1d0h0m5s")])
+    func durationLikeNdp(seconds: Int, text: String) {
+        #expect(ArpManager.formatDuration(seconds) == text)
     }
 
     @Test func truncatedDumpIsIgnored() {
