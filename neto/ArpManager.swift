@@ -14,24 +14,30 @@ import Darwin
 /// Reads the neighbor tables: IPv4 ARP (like `arp -an`) and IPv6 neighbor discovery (like `ndp -an`).
 ///
 /// On macOS both come from the routing table via `sysctl(NET_RT_FLAGS, RTF_LLINFO)`, parsed the way
-/// FreeBSD/Darwin `arp` and `ndp` do it. iOS/iPadOS does not expose the routing table to apps.
+/// FreeBSD/Darwin `arp` and `ndp` do it. On iOS/iPadOS the app cannot read these tables and reports
+/// `ArpError.platformNotSupported`.
 final class ArpManager {
     
     /// Retrieves the current ARP (IPv4) and NDP (IPv6) neighbor tables from the system
-    /// - Returns: ArpResult containing all entries grouped by interface
-    /// - Throws: ArpError if the operation fails
+    /// - Returns: ArpResult containing all entries grouped by interface; if only the IPv6 dump fails, the IPv4 entries
+    ///   with the IPv6 error in `ipv6Error`
+    /// - Throws: ArpError if the IPv4 table cannot be read, `ArpError.platformNotSupported` on iOS/iPadOS
     func getArpTable() async throws -> ArpResult {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     #if os(macOS)
-                    // IPv4 must work; a failing IPv6 dump only drops the IPv6 part
-                    let entries = try Self.readNeighborTable(family: AF_INET) + ((try? Self.readNeighborTable(family: AF_INET6)) ?? [])
+                    // IPv4 must work; a failing IPv6 dump only drops the IPv6 part and is reported with the result
+                    let ipv4 = try Self.readNeighborTable(family: AF_INET)
+                    do {
+                        let ipv6 = try Self.readNeighborTable(family: AF_INET6)
+                        continuation.resume(returning: ArpResult(entries: ipv4 + ipv6))
+                    } catch {
+                        continuation.resume(returning: ArpResult(entries: ipv4, ipv6Error: error.localizedDescription))
+                    }
                     #else
-                    // On iOS/iPadOS, we can only get basic interface information
-                    let entries = try Self.getBasicInterfaceEntries()
+                    throw ArpError.platformNotSupported
                     #endif
-                    continuation.resume(returning: ArpResult(entries: entries))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -177,9 +183,13 @@ final class ArpManager {
             } else if effectiveExpire == 0 {
                 status = "permanent"
             } else if effectiveExpire <= now {
-                status = "expired"
-            } else {
+                status = isIPv6 ? "expired" : "route expired"
+            } else if isIPv6 {
                 status = "expires in \(formatDuration(effectiveExpire - now))"
+            } else {
+                // IPv4: the route's rmx_expire, which `arp -an` does not print; it is not the link-layer
+                // reachability timer that `arp -anl` shows as Expire(O)/Expire(I)
+                status = "route expires in \(formatDuration(effectiveExpire - now))"
             }
             if let info, let state = neighborStateName(info.state) {
                 status = "\(state), \(status)"
@@ -254,44 +264,19 @@ final class ArpManager {
         return text + "\(rest)s"
     }
     #endif
-    
-    #if !os(macOS)
-    /// Retrieves basic interface information for iOS/iPadOS
-    /// Note: iOS/iPadOS sandbox restrictions limit access to detailed ARP information
-    private static func getBasicInterfaceEntries() throws -> [ArpEntry] {
-        var entries: [ArpEntry] = []
-        
-        // On iOS/iPadOS, we can only get basic network interface information
-        // due to sandbox restrictions that prevent access to detailed ARP tables
-        
-        // Create a basic entry showing that ARP information is limited on iOS/iPadOS
-        let entry = ArpEntry(
-            ipAddress: "N/A",
-            macAddress: "N/A", 
-            interface: "iOS/iPadOS",
-            status: "Limited access due to sandbox restrictions"
-        )
-        entries.append(entry)
-        
-        return entries
-    }
-    #endif
 }
 
 /// Errors that can occur during ARP operations
 enum ArpError: LocalizedError {
     case systemCallFailed(String)
-    case parsingFailed
     case platformNotSupported
     
     var errorDescription: String? {
         switch self {
         case .systemCallFailed(let message):
             return "System call failed: \(message)"
-        case .parsingFailed:
-            return "Failed to parse neighbor cache data"
         case .platformNotSupported:
-            return "Platform not supported for ARP operations"
+            return "This app cannot read the ARP or IPv6 neighbor (NDP) table on iOS and iPadOS"
         }
     }
 } 

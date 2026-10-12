@@ -89,7 +89,7 @@ struct ArpNeighborTableParsingTests {
         #expect(entries.map(\.ipAddress) == ["192.168.64.1", "192.168.64.12", "224.0.0.251"])
         #expect(entries.map(\.macAddress) == ["c2:c7:db:db:7f:64", "9a:bf:7c:ad:e8:7f", "01:00:5e:00:00:fb"])
         #expect(entries.map(\.interface) == ["bridge100", "bridge100", "en0"])
-        #expect(entries.map(\.status) == ["permanent", "expires in 16m53s", "permanent"])
+        #expect(entries.map(\.status) == ["permanent", "route expires in 16m53s", "permanent"])
         #expect(entries.map(\.linkType) == ["bridge", "bridge", "ethernet"])
         #expect(entries.filter { !$0.isScoped }.isEmpty)
     }

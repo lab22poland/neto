@@ -84,30 +84,37 @@ final class DnsManager {
 
     private func lookup(name: String, type: DNSRecordType, server: DNSServer, transport: DNSTransport, ednsUDPSize: UInt16) async -> DnsResult {
         let started = Date()
+        var usedTransport = transport
         do {
             // DoH recommends ID 0 so responses are cacheable (RFC 8484 4.1)
             let id = transport == .https ? 0 : UInt16.random(in: 0...UInt16.max)
             guard let wireName = DNSWire.asciiName(name) else { throw DNSMessageError.invalidName(name) }
             let query = try DNSWire.query(name: wireName, type: type.rawValue, id: id, ednsUDPSize: ednsUDPSize)
             var exchange = try await send(query, to: server, over: transport)
-            var usedTransport = transport
             // Truncation is read from the raw header: the rest of a truncated answer may not parse
             if transport == .udp, let header = DNSWire.header(exchange.response), header.flags & 0x0200 != 0 {
                 // RFC 7766: a truncated UDP answer is retried over TCP, like dig
-                exchange = try await send(query, to: server, over: .tcp)
                 usedTransport = .tcp
+                do {
+                    exchange = try await send(query, to: server, over: .tcp)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    throw DNSLookupError.tcpRetryFailed(error.localizedDescription)
+                }
             }
             let message = try DNSWire.parse(exchange.response)
-            return DnsResult(name: name, type: type, server: server, transport: usedTransport, message: message,
-                             queryTime: exchange.milliseconds, responseSize: exchange.response.count, timestamp: started)
+            return DnsResult(name: name, type: type, server: server, transport: usedTransport, endpoint: exchange.endpoint,
+                             message: message, queryTime: exchange.milliseconds, responseSize: exchange.response.count,
+                             timestamp: started)
         } catch {
-            return DnsResult(name: name, type: type, server: server, transport: transport, error: error.localizedDescription,
+            return DnsResult(name: name, type: type, server: server, transport: usedTransport, error: error.localizedDescription,
                              timestamp: started)
         }
     }
 
     /// One query/response exchange; the time is measured from sending to the complete response, like dig's "Query time"
-    private func send(_ query: [UInt8], to server: DNSServer, over transport: DNSTransport) async throws -> (response: [UInt8], milliseconds: Double) {
+    private func send(_ query: [UInt8], to server: DNSServer, over transport: DNSTransport) async throws -> DNSExchange {
         let accept = { (response: [UInt8]) in DNSWire.isResponse(response, to: query) }
         switch transport {
         case .udp:
@@ -129,7 +136,7 @@ final class DnsManager {
     /// Over UDP, datagrams that do not answer the query (other ID or question) are ignored like dig does;
     /// over a stream the single answer must match.
     private func exchange(_ query: [UInt8], host: String, port: UInt16, parameters: NWParameters, framed: Bool,
-                          accept: @escaping ([UInt8]) -> Bool) async throws -> (response: [UInt8], milliseconds: Double) {
+                          accept: @escaping ([UInt8]) -> Bool) async throws -> DNSExchange {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw DNSLookupError.invalidServer(host) }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: parameters)
         let completion = DNSCompletion()
@@ -140,17 +147,23 @@ final class DnsManager {
                 // Already cancelled: the continuation was resumed, don't start the connection
                 guard completion.set(continuation, cleanup: { connection.cancel() }) else { return }
                 let clock = QueryClock()
+                // The address and port the connection actually reached (a DoT host name resolves to one of several)
+                func finish(_ response: [UInt8]) {
+                    let remote = DNSServerEndpoint.address(of: connection.currentPath?.remoteEndpoint)
+                    let endpoint = DNSServerEndpoint(address: remote?.address, port: remote?.port ?? port, host: host,
+                                                     url: nil, httpProtocol: nil)
+                    completion.finish(.success(DNSExchange(response: response, milliseconds: clock.milliseconds, endpoint: endpoint)))
+                }
                 func receiveDatagram() {
                     connection.receiveMessage { data, _, _, error in
                         guard let data else { completion.finish(.failure(error ?? DNSLookupError.noResponse)); return }
                         if accept([UInt8](data)) {
-                            completion.finish(.success(([UInt8](data), elapsed())))
+                            finish([UInt8](data))
                         } else {
                             receiveDatagram()   // spoofed or stale datagram: keep waiting until the timeout
                         }
                     }
                 }
-                func elapsed() -> Double { clock.milliseconds }
 
                 connection.stateUpdateHandler = { state in
                     switch state {
@@ -170,7 +183,11 @@ final class DnsManager {
                                 connection.receive(minimumIncompleteLength: length, maximumLength: length) { body, _, _, error in
                                     if let body, body.count == length {
                                         let response = [UInt8](body)
-                                        completion.finish(accept(response) ? .success((response, elapsed())) : .failure(DNSLookupError.mismatchedResponse))
+                                        if accept(response) {
+                                            finish(response)
+                                        } else {
+                                            completion.finish(.failure(DNSLookupError.mismatchedResponse))
+                                        }
                                     } else {
                                         completion.finish(.failure(error ?? DNSLookupError.noResponse))
                                     }
@@ -197,16 +214,21 @@ final class DnsManager {
         }
     }
 
-    /// DoH POST with application/dns-message (RFC 8484 4.1)
-    private func httpsExchange(_ query: [UInt8], url: URL) async throws -> (response: [UInt8], milliseconds: Double) {
+    /// DoH POST with application/dns-message (RFC 8484 4.1).
+    /// The time and the server address come from URLSessionTaskMetrics: from sending the request to the end of the
+    /// response, without the host name lookup and the TLS/QUIC handshake (the UDP/TCP/DoT clocks also start on a
+    /// ready connection).
+    /// Behind an HTTP proxy the metrics' remote address is the proxy's, not the DoH server's.
+    private func httpsExchange(_ query: [UInt8], url: URL) async throws -> DNSExchange {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         request.setValue("application/dns-message", forHTTPHeaderField: "Content-Type")
         request.setValue("application/dns-message", forHTTPHeaderField: "Accept")
         request.httpBody = Data(query)
+        let collector = DoHMetricsCollector()
         let startedAt = DispatchTime.now().uptimeNanoseconds
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        let (data, response) = try await URLSession.shared.data(for: request, delegate: collector)
+        let wallClock = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw DNSLookupError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? 0)
         }
@@ -215,7 +237,27 @@ final class DnsManager {
         guard mediaType == "application/dns-message" else {
             throw DNSLookupError.notDNSMessage(http.value(forHTTPHeaderField: "Content-Type") ?? "none")
         }
-        return ([UInt8](data), milliseconds)
+        let measurement = Self.dohMeasurement(collector.transactions, url: url, fallbackMilliseconds: wallClock)
+        return DNSExchange(response: [UInt8](data), milliseconds: measurement.milliseconds, endpoint: measurement.endpoint)
+    }
+
+    /// Query time and server endpoint of a DoH exchange from its transaction metrics. The last network transaction
+    /// carries the response (an earlier one may be a cache lookup or a redirect); without metrics the time falls back
+    /// to the wall clock around the whole request and the address stays unknown.
+    static func dohMeasurement(_ transactions: [DoHTransaction], url: URL,
+                               fallbackMilliseconds: Double) -> (milliseconds: Double, endpoint: DNSServerEndpoint) {
+        let host = url.host ?? url.absoluteString
+        let defaultPort = UInt16(url.port ?? 443)
+        guard let last = transactions.last(where: { $0.isNetworkLoad }) else {
+            return (fallbackMilliseconds, DNSServerEndpoint(address: nil, port: defaultPort, host: host, url: url, httpProtocol: nil))
+        }
+        var milliseconds = fallbackMilliseconds
+        if let start = last.requestStart, let end = last.responseEnd, end >= start {
+            milliseconds = end.timeIntervalSince(start) * 1000
+        }
+        let port = last.remotePort.flatMap { UInt16(exactly: $0) } ?? defaultPort
+        return (milliseconds, DNSServerEndpoint(address: last.remoteAddress, port: port, host: host, url: url,
+                                                httpProtocol: last.protocolName))
     }
 
     // MARK: - System Resolver
@@ -293,6 +335,7 @@ enum DNSLookupError: LocalizedError {
     case unsupportedTransport(DNSTransport, String)
     case httpStatus(Int)
     case notDNSMessage(String)
+    case tcpRetryFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -303,7 +346,60 @@ enum DNSLookupError: LocalizedError {
         case .unsupportedTransport(let transport, let server): return "\(server) does not support \(transport.rawValue)"
         case .httpStatus(let status): return "DoH server answered HTTP \(status)"
         case .notDNSMessage(let type): return "DoH server answered with \(type) instead of application/dns-message"
+        case .tcpRetryFailed(let reason): return "The UDP answer was truncated and the retry over TCP failed: \(reason)"
         }
+    }
+}
+
+/// A response with the time it took and the server end of the connection
+private struct DNSExchange {
+    let response: [UInt8]
+    let milliseconds: Double
+    let endpoint: DNSServerEndpoint
+}
+
+/// The parts of URLSessionTaskTransactionMetrics a DoH result needs (the metrics class cannot be built in tests)
+struct DoHTransaction {
+    let isNetworkLoad: Bool
+    let requestStart: Date?
+    let responseEnd: Date?
+    let remoteAddress: String?
+    let remotePort: Int?
+    /// ALPN protocol, e.g. "h2" or "h3"
+    let protocolName: String?
+
+    init(isNetworkLoad: Bool, requestStart: Date?, responseEnd: Date?, remoteAddress: String?, remotePort: Int?, protocolName: String?) {
+        self.isNetworkLoad = isNetworkLoad
+        self.requestStart = requestStart
+        self.responseEnd = responseEnd
+        self.remoteAddress = remoteAddress
+        self.remotePort = remotePort
+        self.protocolName = protocolName
+    }
+
+    init(_ metrics: URLSessionTaskTransactionMetrics) {
+        self.init(isNetworkLoad: metrics.resourceFetchType == .networkLoad, requestStart: metrics.requestStartDate,
+                  responseEnd: metrics.responseEndDate, remoteAddress: metrics.remoteAddress, remotePort: metrics.remotePort,
+                  protocolName: metrics.networkProtocolName)
+    }
+}
+
+/// Task delegate that keeps the transaction metrics of one DoH request
+private final class DoHMetricsCollector: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var collected: [DoHTransaction] = []
+
+    var transactions: [DoHTransaction] {
+        lock.lock()
+        defer { lock.unlock() }
+        return collected
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        let transactions = metrics.transactionMetrics.map(DoHTransaction.init)
+        lock.lock()
+        collected = transactions
+        lock.unlock()
     }
 }
 
@@ -328,13 +424,13 @@ private final class QueryClock: @unchecked Sendable {
 /// Resumes a continuation exactly once from whichever thread gets there first, then runs the cleanup
 private final class DNSCompletion: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<(response: [UInt8], milliseconds: Double), Error>?
+    private var continuation: CheckedContinuation<DNSExchange, Error>?
     private var cleanup: (() -> Void)?
-    private var pending: Result<(response: [UInt8], milliseconds: Double), Error>?
+    private var pending: Result<DNSExchange, Error>?
 
     /// Returns false if the operation already finished (cancelled early); the continuation is resumed then
     @discardableResult
-    func set(_ continuation: CheckedContinuation<(response: [UInt8], milliseconds: Double), Error>, cleanup: @escaping () -> Void) -> Bool {
+    func set(_ continuation: CheckedContinuation<DNSExchange, Error>, cleanup: @escaping () -> Void) -> Bool {
         lock.lock()
         if let pending {
             self.pending = nil
@@ -349,7 +445,7 @@ private final class DNSCompletion: @unchecked Sendable {
         return true
     }
 
-    func finish(_ result: Result<(response: [UInt8], milliseconds: Double), Error>) {
+    func finish(_ result: Result<DNSExchange, Error>) {
         lock.lock()
         guard let continuation else {
             if pending == nil { pending = result }
@@ -362,5 +458,19 @@ private final class DNSCompletion: @unchecked Sendable {
         lock.unlock()
         cleanup?()
         continuation.resume(with: result)
+    }
+}
+
+extension DNSServerEndpoint {
+    /// IP address and port of a resolved connection endpoint; nil for a name or other endpoint kinds.
+    /// A scoped IPv6 address keeps its zone as an interface name ("fe80::1%lo0"), which is easier to read than
+    /// the numeric scope ID dig's isc_sockaddr_format prints ("fe80::1%1").
+    static func address(of endpoint: NWEndpoint?) -> (address: String, port: UInt16)? {
+        guard case .hostPort(let host, let port)? = endpoint else { return nil }
+        switch host {
+        case .ipv4(let address): return ("\(address)", port.rawValue)
+        case .ipv6(let address): return ("\(address)", port.rawValue)
+        default: return nil
+        }
     }
 }

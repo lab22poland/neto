@@ -138,12 +138,18 @@ final class netoUITests: XCTestCase {
     @MainActor
     func testArpTableLoadsWithoutError() throws {
         openTool("arp", expecting: "arp.header")
+        #if os(iOS)
+        // iOS/iPadOS: the app cannot read the table and must say so instead of showing a table
+        XCTAssertTrue(element("arp.error").waitForExistence(timeout: 10), "ARP must report that iOS is not supported")
+        XCTAssertFalse(element("arp.entries").exists, "No table on iOS")
+        #else
         let entries = element("arp.entries")
         let empty = element("arp.empty")
         let loaded = NSPredicate { _, _ in entries.exists || empty.exists }
         let expectation = XCTNSPredicateExpectation(predicate: loaded, object: nil)
         XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: 10), .completed, "ARP table never finished loading")
         XCTAssertFalse(element("arp.error").exists, "ARP refresh must not report an error")
+        #endif
     }
 
     // MARK: - Helpers

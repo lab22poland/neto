@@ -25,3 +25,13 @@ struct NetworkToolTests {
         #endif
     }
 }
+
+struct AboutTests {
+
+    @Test func versionComesFromTheBundle() {
+        #expect(AboutView.versionText(["CFBundleShortVersionString": "1.2", "CFBundleVersion": "34"]) == "Version 1.2 (34)")
+        #expect(AboutView.versionText(["CFBundleShortVersionString": "1.2", "CFBundleVersion": "1.2"]) == "Version 1.2")
+        #expect(AboutView.versionText(["CFBundleShortVersionString": "1.2"]) == "Version 1.2")
+        #expect(AboutView.versionText(nil) == "Version unknown")
+    }
+}
