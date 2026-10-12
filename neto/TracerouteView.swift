@@ -15,16 +15,18 @@ struct TracerouteView: View {
     @StateObject private var viewModel = TracerouteViewModel()
     
     var body: some View {
-        VStack(spacing: 20) {
-            headerSection
-            configurationSection
-            inputSection
-            errorSection
-            progressSection
-            resultsSection
-            Spacer()
+        // The whole tool scrolls, so the results list keeps its minimum height on small screens and windows
+        ScrollView {
+            VStack(spacing: 20) {
+                headerSection
+                configurationSection
+                inputSection
+                errorSection
+                progressSection
+                resultsSection
+            }
+            .padding()
         }
-        .padding()
         .navigationTitle("Traceroute")
         .onKeyPress(.escape) {
             if viewModel.isTracing {
@@ -220,7 +222,8 @@ struct TracerouteView: View {
                         }
                         .padding(.vertical, 4)
                     }
-                    .frame(maxHeight: 300)
+                    // Without a minimum the layout squeezes the list to zero height when space is short
+                    .frame(minHeight: 120, maxHeight: 300)
                     .background(.quaternary)
                     .cornerRadius(8)
                 }

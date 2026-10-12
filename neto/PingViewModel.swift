@@ -31,6 +31,8 @@ final class PingViewModel: ObservableObject {
     private var pingTask: Task<Void, Never>?
     /// Identifies the current run, so a late completion of a stopped run cannot reset a newer one
     private var currentRunID: UUID?
+    /// The "Ping stopped by user" row is not a packet and is left out of the statistics
+    private var stopRowID: UUID?
     
     // MARK: - Public Methods
     
@@ -93,6 +95,7 @@ final class PingViewModel: ObservableObject {
                 responseTime: 0,
                 message: "Ping stopped by user"
             )
+            stopRowID = result.id
             pingResults.append(result)
         }
     }
@@ -104,10 +107,11 @@ final class PingViewModel: ObservableObject {
     
     /// Gets ping statistics
     var pingStatistics: PingStatistics {
-        let successfulPings = pingResults.filter { $0.success }
-        let failedPings = pingResults.filter { !$0.success }
+        let packets = pingResults.filter { $0.id != stopRowID }
+        let successfulPings = packets.filter { $0.success }
+        let failedPings = packets.filter { !$0.success }
         
-        let totalPings = pingResults.count
+        let totalPings = packets.count
         let successCount = successfulPings.count
         let failureCount = failedPings.count
         
