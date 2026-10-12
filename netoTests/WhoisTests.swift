@@ -173,6 +173,395 @@ struct WhoisManagerLogicTests {
     }
 }
 
+/// Summary fields come only from the last server's answer; fixtures are real answers captured on 12/10/2026 (trimmed)
+struct WhoisSummaryTests {
+    private let manager = WhoisManager()
+
+    private func crlf(_ text: String) -> String { text.replacingOccurrences(of: "\n", with: "\r\n") }
+
+    /// whois.iana.org about the .com TLD (what the chain prints before Verisign's answer)
+    private let ianaCom = """
+    % IANA WHOIS server
+    % for more information on IANA, visit http://www.iana.org
+    % This query returned 1 object
+
+    refer:        whois.verisign-grs.com
+
+    domain:       COM
+
+    organisation: VeriSign Global Registry Services
+    address:      12061 Bluemont Way
+
+    nserver:      A.GTLD-SERVERS.NET 192.5.6.30 2001:503:a83e:0:0:0:2:30
+    nserver:      B.GTLD-SERVERS.NET 192.33.14.30 2001:503:231d:0:0:0:2:30
+
+    whois:        whois.verisign-grs.com
+
+    status:       ACTIVE
+    remarks:      Registration information: http://www.verisigninc.com
+
+    created:      1985-01-01
+    changed:      2026-03-10
+    source:       IANA
+
+    """
+
+    /// whois.iana.org about .uk: `whois:` is empty, so the chain ends here for bbc.co.uk (like /usr/bin/whois)
+    private let ianaUK = """
+    % IANA WHOIS server
+    refer:        
+
+    domain:       UK
+
+    organisation: Nominet UK
+    address:      Minerva House
+
+    nserver:      DNS1.NIC.UK 213.248.216.1 2a01:618:400:0:0:0:0:1
+    nserver:      NSA.NIC.UK 156.154.100.3 2001:502:ad09:0:0:0:0:3
+
+    whois:        
+
+    status:       ACTIVE
+    created:      1985-07-24
+    source:       IANA
+
+    """
+
+    @Test func verisignNoMatchShowsNoFields() {
+        let verisign = """
+        No match for domain "THIS-DOMAIN-DOES-NOT-EXIST-XYZ123.COM".
+        >>> Last update of whois database: 2026-10-12T13:33:37Z <<<
+
+        """
+        let summary = manager.summarize(lastAnswer: verisign, server: "whois.verisign-grs.com",
+                                        query: "this-domain-does-not-exist-xyz123.com", incompleteReason: nil)
+        #expect(summary.outcome == .notFound)
+        #expect(summary.status.hasPrefix("Not found"))
+        #expect(summary.fields.registrar == nil && summary.fields.registrationDate == nil)
+        #expect(summary.fields.expirationDate == nil && summary.fields.nameServers.isEmpty)
+    }
+
+    @Test(arguments: [
+        "No match for domain \"THIS-DOMAIN-DOES-NOT-EXIST-XYZ123.NET\".",                        // Verisign .com/.net
+        "    No match for \"this-domain-does-not-exist-xyz123.co.uk\".\r",                         // Nominet
+        "No match found for n + = this-object-does-not-exist-xyz123.",                             // ARIN
+        "Domain not found.",                                                                       // PIR .org, Identity Digital .io
+        "No information available about domain name this-domain-does-not-exist-xyz123.pl in the Registry NASK database.\r",
+        "Domain: this-domain-does-not-exist-xyz123.de\nStatus: free",                              // DENIC
+    ])
+    func notFoundAnswers(answer: String) {
+        #expect(manager.isNotFound(answer))
+    }
+
+    @Test func foundAnswerIsNotNotFound() {
+        #expect(!manager.isNotFound(ianaCom))
+        #expect(!manager.isNotFound("Domain Name: google.com\nDomain Status: clientUpdateProhibited\n"))
+    }
+
+    @Test func ianaBlockNeverLeaksIntoTheSummary() {
+        // bbc.co.uk: the chain ends at IANA, whose record is about .uk
+        let summary = manager.summarize(lastAnswer: ianaUK, server: "whois.iana.org", query: "bbc.co.uk", incompleteReason: nil)
+        #expect(summary.outcome == .ianaOnly)
+        #expect(summary.fields.registrar == nil)        // not "Nominet UK"
+        #expect(summary.fields.registrationDate == nil) // not 1985-07-24
+        #expect(summary.fields.nameServers.isEmpty)     // not the .uk TLD servers
+    }
+
+    @Test func ianaRecordOfTheTLDItselfIsShown() {
+        let summary = manager.summarize(lastAnswer: ianaUK, server: "whois.iana.org", query: "uk", incompleteReason: nil)
+        #expect(summary.outcome == .found)
+        #expect(summary.fields.registrar == "Nominet UK")
+        #expect(summary.fields.registrationDate == "1985-07-24")
+        #expect(summary.fields.nameServers == ["DNS1.NIC.UK", "NSA.NIC.UK"])
+    }
+
+    @Test func failedReferralAfterIANAIsIncompleteWithoutFields() {
+        let summary = manager.summarize(lastAnswer: ianaCom, server: "whois.iana.org", query: "google.com",
+                                        incompleteReason: "Incomplete: whois.verisign-grs.com did not answer (timed out)")
+        #expect(summary.outcome == .incomplete)
+        #expect(summary.status == "Incomplete: whois.verisign-grs.com did not answer (timed out)")
+        #expect(summary.fields.registrar == nil && summary.fields.nameServers.isEmpty)
+    }
+
+    @Test func cutOffAnswerKeepsItsFieldsButIsIncomplete() {
+        let partial = "Domain Name: google.com\nCreation Date: 1997-09-15T07:00:00+0000\nRegistrar: MarkMonitor, Inc.\nName Ser"
+        let summary = manager.summarize(lastAnswer: partial, server: "whois.markmonitor.com", query: "google.com",
+                                        incompleteReason: "Incomplete: whois.markmonitor.com answer cut off after 30 s")
+        #expect(summary.outcome == .incomplete)
+        #expect(summary.fields.registrar == "MarkMonitor, Inc.")
+        #expect(summary.fields.nameServers.isEmpty)
+    }
+
+    @Test func emptyAnswerShowsNoData() {
+        // RIPE "%ERROR:101: no entries found" is a comment that whois.c strips, leaving nothing
+        let summary = manager.summarize(lastAnswer: "", server: "whois.ripe.net", query: "XY1-RIPE", incompleteReason: nil)
+        #expect(summary.outcome == .noData)   // not "not found": a throttling server answers the same way
+        #expect(summary.status.hasPrefix("No data"))
+        #expect(summary.fields.registrar == nil && summary.fields.nameServers.isEmpty)
+    }
+
+    @Test func markMonitorDatesComeFromTheRegistrar() {
+        let markMonitor = """
+        Domain Name: google.com
+        Registry Domain ID: 2138514_DOMAIN_COM-VRSN
+        Registrar WHOIS Server: whois.markmonitor.com
+        Registrar URL: http://www.markmonitor.com
+        Updated Date: 2024-08-02T02:17:33+0000
+        Creation Date: 1997-09-15T07:00:00+0000
+        Registrar Registration Expiration Date: 2028-09-13T07:00:00+0000
+        Registrar: MarkMonitor, Inc.
+        Registrar IANA ID: 292
+        Registrant Organization: Google LLC
+        Name Server: ns2.google.com
+        Name Server: ns1.google.com
+        DNSSEC: unsigned
+        """
+        let summary = manager.summarize(lastAnswer: markMonitor, server: "whois.markmonitor.com", query: "google.com", incompleteReason: nil)
+        #expect(summary.outcome == .found)
+        #expect(summary.fields.registrar == "MarkMonitor, Inc.")
+        #expect(summary.fields.registrationDate == "1997-09-15T07:00:00+0000")
+        #expect(summary.fields.expirationDate == "2028-09-13T07:00:00+0000")
+        #expect(summary.fields.nameServers == ["ns2.google.com", "ns1.google.com"])
+    }
+
+    @Test func arinPrefersOrgNameAndTheNetworkRegDate() {
+        let arin = """
+        NetRange:       8.8.8.0 - 8.8.8.255
+        NetName:        GOGL
+        OriginAS:       
+        Organization:   Google LLC (GOGL)
+        RegDate:        2023-12-28
+        Updated:        2023-12-28
+
+
+
+        OrgName:        Google LLC
+        OrgId:          GOGL
+        RegDate:        2000-03-30
+        Updated:        2019-10-31
+        """
+        let fields = manager.parseWhoisResponse(arin, for: "8.8.8.8")
+        #expect(fields.registrar == "Google LLC")
+        #expect(fields.registrationDate == "2023-12-28")
+        #expect(fields.expirationDate == nil)
+        #expect(fields.nameServers.isEmpty)
+    }
+
+    @Test func naskRegistrarOnTheNextLineAndNameServerBlock() {
+        let nask = crlf("""
+        DOMAIN NAME:                    nask.pl
+        registrant type:                organization
+        nameservers:                    bilbo.nask.pl. [195.187.245.51]
+                                        eomer.nask.pl. [193.59.201.24]
+                                        ns.tpnet.pl. [80.50.50.50]
+        created:                        1995.04.26 13:00:00
+        last modified:                  2005.04.26 09:55:09
+        renewal date:                   not defined
+
+        REGISTRAR:
+        NASK
+        ul. Kolska 12
+        Tel: +48.223808300
+        """)
+        let fields = manager.parseWhoisResponse(nask, for: "nask.pl")
+        #expect(fields.registrar == "NASK")
+        #expect(fields.registrationDate == "1995.04.26 13:00:00")
+        #expect(fields.expirationDate == "not defined")   // NASK's literal value
+        #expect(fields.nameServers == ["bilbo.nask.pl", "eomer.nask.pl", "ns.tpnet.pl"])
+    }
+
+    @Test func nominetIndentedBlocks() {
+        let nominet = crlf("""
+
+            Domain name:
+                bbc.co.uk
+
+            Registrar:
+                British Broadcasting Corporation [Tag = BBC]
+                URL: https://www.bbc.co.uk
+
+            Relevant dates:
+                Registered on: before Aug-1996
+                Expiry date:  13-Dec-2034
+                Last updated:  29-Oct-2025
+
+            Name servers:
+                ddns0.bbc.co.uk           148.163.199.1  2607:f740:e04e::1
+                ddns0.bbc.com
+                dns1.bbc.co.uk            198.51.45.9  2a00:edc0:6259:7:9::2
+
+            WHOIS lookup made at 17:24:45 12-Oct-2026
+        """)
+        let fields = manager.parseWhoisResponse(nominet, for: "bbc.co.uk")
+        #expect(fields.registrar == "British Broadcasting Corporation [Tag = BBC]")
+        #expect(fields.registrationDate == "before Aug-1996")
+        #expect(fields.expirationDate == "13-Dec-2034")
+        #expect(fields.nameServers == ["ddns0.bbc.co.uk", "ddns0.bbc.com", "dns1.bbc.co.uk"])
+    }
+
+    @Test func lacnicOwner() {
+        let lacnic = """
+        % LACNIC resource: whois.lacnic.net
+
+        inetnum:     200.1.0.0/22
+        status:      allocated
+        owner:       Corporacion Andina de Fomento.
+        ownerid:     VE-CAFO-LACNIC
+        owner-c:     JL10-ARIN
+        created:     19930513
+        changed:     19930513
+
+        nic-hdl:     JL10-ARIN
+        person:      Javier Lopez
+        created:     20030221
+        """
+        let fields = manager.parseWhoisResponse(lacnic, for: "200.1.1.1")
+        #expect(fields.registrar == "Corporacion Andina de Fomento.")
+        #expect(fields.registrationDate == "19930513")
+    }
+
+    @Test func afrinicOrgNameBeforeTheOrganisationHandle() {
+        let afrinic = """
+        inetnum:        196.216.2.0 - 196.216.3.255
+        netname:        AFRINIC
+        descr:          AfriNIC - Internal Use
+        org:            ORG-AFNC1-AFRINIC
+        source:         AFRINIC # Filtered
+
+        organisation:   ORG-AFNC1-AFRINIC
+        org-name:       African Network Information Center - (AfriNIC) Ltd
+        org-type:       RIR
+        """
+        #expect(manager.parseWhoisResponse(afrinic, for: "196.216.2.1").registrar
+                == "African Network Information Center - (AfriNIC) Ltd")
+    }
+
+    @Test func apnicOrgNameAndNoCreationDate() {
+        let apnic = """
+        inetnum:        1.1.1.0 - 1.1.1.255
+        netname:        APNIC-LABS
+        descr:          APNIC and Cloudflare DNS Resolver project
+        org:            ORG-ARAD1-AP
+        last-modified:  2023-04-26T22:57:58Z
+        source:         APNIC
+
+        organisation:   ORG-ARAD1-AP
+        org-name:       APNIC Research and Development
+        org-type:       LIR
+        """
+        let fields = manager.parseWhoisResponse(apnic, for: "1.1.1.1")
+        #expect(fields.registrar == "APNIC Research and Development")
+        #expect(fields.registrationDate == nil)   // last-modified is not a creation date
+    }
+
+    @Test func afrinicWithoutOrganisationSaysNoFieldsRecognized() {
+        // 41.0.0.1: no organisation object; descr/netname are free text and are not used as the holder
+        let afrinic = """
+        inetnum:        41.0.0.0 - 41.0.255.255
+        netname:        Vodacom_Enterprise_Networks_NSA
+        descr:          The IP Block 41.0.0.0/16 has been assigned to Vodacom Bussiness for ISP bussiness (Shared ENS/NSA)
+        country:        ZA
+        status:         ASSIGNED PA
+        mnt-by:         VODACOM-MNT
+        source:         AFRINIC # Filtered
+        """
+        let summary = manager.summarize(lastAnswer: afrinic, server: "whois.afrinic.net", query: "41.0.0.1", incompleteReason: nil)
+        #expect(summary.outcome == .found)
+        #expect(summary.status == "No summary fields recognized; see the raw response")
+        #expect(summary.fields.registrar == nil)
+    }
+
+    @Test func emptyValueIsNilNotEmptyString() {
+        let fields = manager.parseWhoisResponse("Registrar:\nRegistrar IANA ID: 9999\nCreation Date: \n", for: "x.com")
+        #expect(fields.registrar == nil)
+        #expect(fields.registrationDate == nil)
+    }
+}
+
+/// The query I/O like whois.c: once connected, an error ends the answer (even an empty one) instead of failing the server.
+/// Uses a one-shot TCP server on 127.0.0.1, so no internet is needed.
+struct WhoisConnectionTests {
+
+    /// Accepts one connection, reads the query, optionally answers, then closes cleanly or resets (SO_LINGER 0)
+    private final class OneShotServer: @unchecked Sendable {
+        let port: UInt16
+
+        init(reply: String, reset: Bool) throws {
+            let listener = socket(AF_INET, SOCK_STREAM, 0)
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let bound = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(listener, sa, length) == 0 && listen(listener, 1) == 0 && getsockname(listener, sa, &length) == 0
+                }
+            }
+            guard listener >= 0, bound else { throw POSIXError(.EADDRNOTAVAIL) }
+            port = UInt16(bigEndian: address.sin_port)
+            let bytes = Array(reply.utf8)
+            Thread.detachNewThread {
+                let client = accept(listener, nil, nil)
+                var buffer = [UInt8](repeating: 0, count: 512)
+                _ = recv(client, &buffer, buffer.count, 0)
+                if !bytes.isEmpty {
+                    _ = bytes.withUnsafeBytes { send(client, $0.baseAddress, $0.count, 0) }
+                    usleep(300_000)   // let the client read the data before the reset
+                }
+                if reset {
+                    var option = linger(l_onoff: 1, l_linger: 0)
+                    setsockopt(client, SOL_SOCKET, SO_LINGER, &option, socklen_t(MemoryLayout<linger>.size))
+                }
+                close(client)
+                close(listener)
+            }
+        }
+    }
+
+    private func ask(_ server: OneShotServer) async throws -> ServerAnswer {
+        try await WhoisManager().queryWhoisServerFreeBSD(server: "127.0.0.1", query: "example.com", port: String(server.port))
+    }
+
+    @Test func resetWithoutDataIsAnEmptyIncompleteAnswer() async throws {
+        let answer = try await ask(OneShotServer(reply: "", reset: true))
+        #expect(answer.bytes.isEmpty)
+        #expect(answer.cutOff?.hasPrefix("closed the connection without an answer") == true)
+    }
+
+    @Test func resetAfterDataKeepsTheData() async throws {
+        let answer = try await ask(OneShotServer(reply: "Domain Name: example.com\n", reset: true))
+        #expect(WhoisManager.decode(answer.bytes) == "Domain Name: example.com\n")
+        #expect(answer.cutOff?.hasPrefix("answer cut off by a connection error") == true)
+    }
+
+    @Test func cleanCloseIsACompleteAnswer() async throws {
+        let empty = try await ask(OneShotServer(reply: "", reset: false))
+        #expect(empty.bytes.isEmpty && empty.cutOff == nil)
+        let full = try await ask(OneShotServer(reply: "Domain Name: example.com\n", reset: false))
+        #expect(WhoisManager.decode(full.bytes) == "Domain Name: example.com\n" && full.cutOff == nil)
+    }
+
+    @Test func refusedConnectionFailsTheServer() async throws {
+        // A bound but not listening port refuses connections: connect() fails, like whois.c's err "connect()"
+        let unused = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(unused) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(unused, $0, length) == 0 && getsockname(unused, $0, &length) == 0 }
+        }
+        try #require(bound)
+        let port = String(UInt16(bigEndian: address.sin_port))
+        await #expect(throws: (any Error).self) {
+            _ = try await WhoisManager().queryWhoisServerFreeBSD(server: "127.0.0.1", query: "example.com", port: port)
+        }
+    }
+}
+
 /// Input validation that enables the lookup button
 @MainActor
 struct WhoisQueryValidationTests {
@@ -198,6 +587,14 @@ struct WhoisQueryValidationTests {
         let viewModel = WhoisViewModel()
         viewModel.targetQuery = query
         #expect(!viewModel.isTargetQueryValid, "\"as\" alone is neither an AS number nor a handle (too short)")
+    }
+
+    @Test func stoppedLookupHasNoResponseTime() {
+        let viewModel = WhoisViewModel()
+        viewModel.targetQuery = "google.com"
+        viewModel.stopWhoisLookup()
+        #expect(viewModel.whoisResult?.success == false)
+        #expect(viewModel.whoisResult?.responseTime == nil)   // the UI shows no "0.00 ms"
     }
 
     @Test func emptyQueryShowsError() {

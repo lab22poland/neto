@@ -67,7 +67,7 @@ final class WhoisViewModel: ObservableObject {
                 domain: targetQuery.trimmingCharacters(in: .whitespacesAndNewlines),
                 success: false,
                 statusMessage: "WHOIS lookup cancelled by user",
-                responseTime: 0
+                responseTime: nil   // nothing was measured
             )
             whoisResult = result
         }

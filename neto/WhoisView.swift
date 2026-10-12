@@ -118,8 +118,8 @@ struct WhoisView: View {
                     .foregroundColor(.secondary)
                 }
                 
-                if let result = viewModel.whoisResult {
-                    Text(String(format: "Response Time: %.2f ms", result.responseTime))
+                if let responseTime = viewModel.whoisResult?.responseTime {
+                    Text(String(format: "Response Time: %.2f ms", responseTime))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -152,12 +152,21 @@ struct WhoisView: View {
                             .foregroundColor(.secondary)
                     }
                     
-                    Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundColor(result.success ? .primary : .secondary)
+                    Image(systemName: statusSymbol(for: result))
+                        .foregroundColor(result.success && result.outcome == .found ? .primary : .secondary)
                 }
                 
-                // Quick info section for successful results
-                if result.success {
+                // Not found, no data, incomplete, IANA-only or no recognized fields: say so; the raw response is still shown
+                if result.success && (result.outcome != .found || !result.hasSummaryFields) {
+                    Text(result.statusMessage)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.secondary)
+                        .accessibilityIdentifier("whois.status")
+                }
+                
+                // Quick info section: fields from the last server's answer only (none when not found or empty)
+                if result.success && result.hasSummaryFields {
                     VStack(alignment: .leading, spacing: 4) {
                         if let registrar = result.registrar {
                             HStack {
@@ -225,6 +234,18 @@ struct WhoisView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+    
+    /// Checkmark only when the last server answered with the object
+    private func statusSymbol(for result: WhoisResult) -> String {
+        guard result.success else { return "xmark.circle.fill" }
+        switch result.outcome {
+        case .found: return "checkmark.circle.fill"
+        case .notFound: return "questionmark.circle.fill"
+        case .noData: return "minus.circle.fill"
+        case .incomplete: return "exclamationmark.triangle.fill"
+        case .ianaOnly: return "info.circle.fill"
         }
     }
 }
