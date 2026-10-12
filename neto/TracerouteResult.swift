@@ -40,6 +40,9 @@ struct TracerouteResult: Identifiable {
     /// ICMP Destination Unreachable code that ended the trace at this hop, if any
     let unreachableCode: UInt8?
     
+    /// Address that answered each probe (nil = no reply); differs between probes when paths are load-balanced (ECMP)
+    let probeAddresses: [String?]
+    
     init(
         id: UUID = UUID(),
         hopNumber: Int,
@@ -50,7 +53,8 @@ struct TracerouteResult: Identifiable {
         message: String,
         isDestination: Bool = false,
         probeTimes: [Double?] = [],
-        unreachableCode: UInt8? = nil
+        unreachableCode: UInt8? = nil,
+        probeAddresses: [String?] = []
     ) {
         self.id = id
         self.hopNumber = hopNumber
@@ -62,10 +66,22 @@ struct TracerouteResult: Identifiable {
         self.isDestination = isDestination
         self.probeTimes = probeTimes
         self.unreachableCode = unreachableCode
+        self.probeAddresses = probeAddresses
     }
     
-    /// Probe times as shown by traceroute, e.g. "1.23 ms  4.56 ms  *"
+    /// Probe times as shown by traceroute, e.g. "1.23 ms  4.56 ms  *". When a probe was answered by another
+    /// address than the previous answer (load-balanced paths), that address is shown before its time.
     var formattedProbeTimes: String {
-        probeTimes.map { $0.map { String(format: "%.2f ms", $0) } ?? "*" }.joined(separator: "  ")
+        var shownAddress = ipAddress
+        return probeTimes.enumerated().map { index, time in
+            guard let time else { return "*" }
+            let address = index < probeAddresses.count ? probeAddresses[index] : nil
+            var text = String(format: "%.2f ms", time)
+            if let address, address != shownAddress {
+                text = "(\(address)) " + text
+                shownAddress = address
+            }
+            return text
+        }.joined(separator: "  ")
     }
 } 

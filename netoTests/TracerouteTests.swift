@@ -73,6 +73,12 @@ struct TracerouteManagerLogicTests {
                                                      unreachableCode: code, family: family) == "(10.0.0.1) \(annotation)")
     }
 
+    @Test func loadBalancedProbesShowTheirAddress() {
+        let result = TracerouteResult(hopNumber: 4, success: true, ipAddress: "10.0.0.1", responseTime: 2, message: "",
+                                      probeTimes: [1, 2, nil, 3], probeAddresses: ["10.0.0.1", "10.0.0.2", nil, "10.0.0.2"])
+        #expect(result.formattedProbeTimes == "1.00 ms  (10.0.0.2) 2.00 ms  *  3.00 ms")
+    }
+
     @Test func probeTimesFormatting() {
         let result = TracerouteResult(hopNumber: 1, success: true, responseTime: 2, message: "", probeTimes: [1.234, nil, 3])
         #expect(result.formattedProbeTimes == "1.23 ms  *  3.00 ms")
