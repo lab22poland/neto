@@ -220,7 +220,8 @@ struct TracerouteView: View {
                         }
                         .padding(.vertical, 4)
                     }
-                    .frame(maxHeight: 300)
+                    // A minimum height keeps rows visible when the window is small (the VStack would squeeze the ScrollView to 0)
+                    .frame(minHeight: 120, maxHeight: 300)
                     .background(.quaternary)
                     .cornerRadius(8)
                 }

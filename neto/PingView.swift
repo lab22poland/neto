@@ -196,7 +196,8 @@ struct PingView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 200)
+                // A minimum height keeps rows visible when the window is small (the VStack would squeeze the ScrollView to 0)
+                .frame(minHeight: 120, maxHeight: 200)
             }
         }
     }

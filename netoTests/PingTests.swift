@@ -215,7 +215,6 @@ final class PingStatisticsTests: XCTestCase {
         viewModel.isPinging = true
         viewModel.stopPing()
 
-        XCTExpectFailure("Known issue: the \"Ping stopped by user\" row is counted as a sent and lost packet")
         XCTAssertEqual(viewModel.pingStatistics.totalPings, 2)
         XCTAssertEqual(viewModel.pingStatistics.packetLoss, 0)
     }

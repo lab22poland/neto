@@ -62,6 +62,8 @@ final class netoUITests: XCTestCase {
                       "All 5 echo requests to 127.0.0.1 must be answered")
         XCTAssertTrue(waitForDisappearance(of: element("ping.stop"), timeout: 5), "Stop must disappear after the run")
         XCTAssertTrue(start.isEnabled, "Start must be enabled again after the run")
+        let replyRow = text(beginningWith: "Reply from 127.0.0.1")
+        XCTAssertTrue(replyRow.exists && !replyRow.frame.isEmpty, "Result rows must be visible in the default window")
     }
 
     @MainActor
@@ -158,6 +160,11 @@ final class netoUITests: XCTestCase {
     }
 
     /// Static text is exposed as `label` on iOS and as `value` on macOS
+    /// Static text is exposed as `label` on iOS and as `value` on macOS
+    private func text(beginningWith prefix: String) -> XCUIElement {
+        app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ OR value BEGINSWITH %@", prefix, prefix)).firstMatch
+    }
+
     private func wait(for element: XCUIElement, text: String, timeout: TimeInterval) -> Bool {
         let predicate = NSPredicate(format: "label == %@ OR value == %@", text, text)
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
