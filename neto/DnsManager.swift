@@ -210,7 +210,9 @@ final class DnsManager {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw DNSLookupError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? 0)
         }
-        guard http.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("application/dns-message") == true else {
+        let mediaType = http.value(forHTTPHeaderField: "Content-Type")?.split(separator: ";").first
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        guard mediaType == "application/dns-message" else {
             throw DNSLookupError.notDNSMessage(http.value(forHTTPHeaderField: "Content-Type") ?? "none")
         }
         return ([UInt8](data), milliseconds)

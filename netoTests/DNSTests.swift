@@ -255,6 +255,33 @@ struct DNSWireReviewTests {
         #expect(!DNSWire.isResponse(query, to: query), "a query (QR=0) is not a response")
     }
 
+    @Test func headerOnlyErrorIsAResponse() throws {
+        // a server that cannot parse the question may answer FORMERR without a question section; dig accepts it
+        let query = try DNSWire.query(name: "example.com", type: 1, id: 0x1234)
+        let formerr: [UInt8] = [0x12, 0x34, 0x81, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]
+        #expect(DNSWire.isResponse(formerr, to: query))
+        let parsed = try DNSWire.parse(formerr)
+        #expect(parsed.rcodeName == "FORMERR")
+    }
+
+    @Test func compressionLoopInsideANameIsRejected() {
+        // question "a" followed by a pointer back to its own first label
+        let message: [UInt8] = [0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0x61, 0xC0, 12, 0, 1, 0, 1]
+        #expect(throws: DNSMessageError.badCompressionPointer) { try DNSWire.parse(message) }
+    }
+
+    static let headerNames: [(flags: UInt16, opcode: String, rcode: String)] = [
+        (0x8000, "QUERY", "NOERROR"), (0xA000, "NOTIFY", "NOERROR"), (0x9800, "RESERVED3", "NOERROR"),
+        (0x800B, "QUERY", "RESERVED11"), (0x800F, "QUERY", "RESERVED15"),
+    ]
+
+    @Test(arguments: headerNames)
+    func opcodeAndRCODENamesLikeDig(flags: UInt16, opcode: String, rcode: String) throws {
+        let parsed = try DNSWire.parse([0, 1, UInt8(flags >> 8), UInt8(flags & 0xFF), 0, 0, 0, 0, 0, 0, 0, 0])
+        #expect(parsed.opcodeName == opcode)
+        #expect(parsed.rcodeName == rcode)
+    }
+
     @Test func truncationIsReadFromTheHeader() throws {
         // a truncated answer that does not parse still reports TC
         let broken: [UInt8] = [0, 1, 0x83, 0x80, 0, 1, 0, 3, 0, 0, 0, 0, 1, 0x61, 0, 0, 1, 0, 1, 0xC0]

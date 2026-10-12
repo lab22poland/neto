@@ -59,7 +59,7 @@ struct DnsResult: Identifiable {
         guard let message else { return ";; \(error ?? "")" }
         // dig counts the EDNS OPT pseudo-record in ADDITIONAL
         let additionalCount = message.additional.count + (message.ednsUDPSize == nil ? 0 : 1)
-        var lines = [";; ->>HEADER<<- opcode: QUERY, status: \(message.rcodeName), id: \(message.id)",
+        var lines = [";; ->>HEADER<<- opcode: \(message.opcodeName), status: \(message.rcodeName), id: \(message.id)",
                      ";; flags: \(message.flagNames.joined(separator: " ")); QUERY: \(message.questions.count), ANSWER: \(message.answers.count), AUTHORITY: \(message.authority.count), ADDITIONAL: \(additionalCount)",
                      "",
                      ";; QUESTION SECTION:"]

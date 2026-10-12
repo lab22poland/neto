@@ -83,7 +83,15 @@ struct DNSMessage: Equatable {
     var rcodeName: String {
         let names = ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"]
         if Int(rcode) < names.count { return names[Int(rcode)] }
-        return rcode == 16 ? "BADVERS" : "RCODE\(rcode)"
+        if rcode == 16 { return "BADVERS" }
+        return rcode < 16 ? "RESERVED\(rcode)" : "RCODE\(rcode)"
+    }
+
+    /// OPCODE name like dig ("QUERY", "NOTIFY", …)
+    var opcodeName: String {
+        let opcode = Int(flags >> 11 & 0xF)
+        let names = [0: "QUERY", 1: "IQUERY", 2: "STATUS", 4: "NOTIFY", 5: "UPDATE"]
+        return names[opcode] ?? "RESERVED\(opcode)"
     }
 
     /// Header flags like dig ("qr rd ra ad")
@@ -177,11 +185,15 @@ enum DNSWire {
     }
 
     /// Whether a response answers this query: same ID, QR set, and the same question (name compared
-    /// case-insensitively, type, class IN) – dig ignores anything else ("ID mismatch", "Question section mismatch")
+    /// case-insensitively, type, class IN) – dig ignores anything else ("ID mismatch", "Question section mismatch").
+    /// Like dig, a response without a question section (e.g. a bare FORMERR or NOTIMP) is accepted on the ID alone.
+    /// Stricter than dig on QR: dig only warns when it is missing, this ignores such a datagram.
     static func isResponse(_ response: [UInt8], to query: [UInt8]) -> Bool {
         guard let header = header(response), let queryHeader = self.header(query),
-              header.id == queryHeader.id, header.flags & 0x8000 != 0,
-              response.count >= 14, UInt16(response[4]) << 8 | UInt16(response[5]) == 1,
+              header.id == queryHeader.id, header.flags & 0x8000 != 0 else { return false }
+        let questionCount = UInt16(response[4]) << 8 | UInt16(response[5])
+        if questionCount == 0 { return true }
+        guard questionCount == 1,
               let (responseName, afterResponse) = try? readName(response, at: 12),
               let (queryName, afterQuery) = try? readName(query, at: 12),
               afterResponse + 4 <= response.count, afterQuery + 4 <= query.count else { return false }
@@ -286,6 +298,7 @@ enum DNSWire {
         var offset = start
         var next: Int?
         var jumps = 0
+        var pointerLimit = start
         var wireLength = 1
         while true {
             guard offset < message.count else { throw DNSMessageError.truncatedMessage }
@@ -294,10 +307,12 @@ enum DNSWire {
                 guard offset + 1 < message.count else { throw DNSMessageError.truncatedMessage }
                 let pointer = (length & 0x3F) << 8 | Int(message[offset + 1])
                 jumps += 1
-                // Pointers may only point backwards (like BIND); this also rules out loops
-                guard pointer < offset, jumps <= 64 else { throw DNSMessageError.badCompressionPointer }
+                // Like BIND, every jump must land before the previous one (and before the name's start),
+                // which rules out loops
+                guard pointer < pointerLimit, jumps <= 64 else { throw DNSMessageError.badCompressionPointer }
                 if next == nil { next = offset + 2 }
                 offset = pointer
+                pointerLimit = pointer
                 continue
             }
             guard length & 0xC0 == 0 else { throw DNSMessageError.malformedRecord("label type") }
