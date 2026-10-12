@@ -51,7 +51,7 @@ struct LiveNetworkTests {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             _ = manager.performTraceroute(to: "8.8.8.8", maxHops: 30, timeout: 2,
                                           onResult: { hops[$0.hopNumber] = $0 },
-                                          onComplete: { continuation.resume() })
+                                          onComplete: { _ in continuation.resume() })
         }
         let last = hops.keys.max().flatMap { hops[$0] }
         #expect(last?.isDestination == true, "\(hops.values.sorted { $0.hopNumber < $1.hopNumber }.map(\.message))")
