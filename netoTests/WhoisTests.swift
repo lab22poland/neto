@@ -37,7 +37,8 @@ struct WhoisManagerLogicTests {
         ("müller.de", "whois.denic.de", "-T dn müller.de\r\n"),
         ("example.dk", "whois.dk-hostmaster.dk", "--show-handles example.dk\r\n"),
         ("AS15169", "whois.arin.net", "+ a 15169\r\n"),
-        ("AS", "whois.arin.net", "+ AS\r\n"),
+        ("AS", "whois.arin.net", "+ a \r\n"),         // same as whois.c (empty AS lookup); the UI rejects "AS" anyway
+        ("AS１５", "whois.arin.net", "+ AS１５\r\n"),  // only ASCII digits make an AS lookup, like whois.c strspn("0123456789")
         ("8.8.8.8", "whois.arin.net", "+ 8.8.8.8\r\n"),
         ("google.com", "whois.verisign-grs.com", "domain google.com\r\n"),
         ("example.org", "whois.publicinterestregistry.org", "example.org\r\n"),
