@@ -205,9 +205,8 @@ final class ArpManager {
             return buffer[(offset + 4)..<(offset + 8)].map(String.init).joined(separator: ".")
         case AF_INET6 where length >= 24 && offset + 24 <= buffer.count:
             var address = Array(buffer[(offset + 8)..<(offset + 24)])
-            let isLinkLocal = address[0] == 0xfe && address[1] & 0xc0 == 0x80
-            let isLinkLocalMulticast = address[0] == 0xff && address[1] & 0x0f == 0x02
-            if isLinkLocal || isLinkLocalMulticast {
+            // Multicast is skipped before this point, so only unicast link-local carries an embedded scope
+            if address[0] == 0xfe && address[1] & 0xc0 == 0x80 {
                 address[2] = 0
                 address[3] = 0
             }

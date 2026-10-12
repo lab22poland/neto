@@ -22,7 +22,7 @@ struct ArpEntry: Identifiable, Hashable {
     /// Network interface name (en0, en4, lo0, etc.)
     let interface: String
     
-    /// Status of the entry: "permanent", "expired" or "expires in …"
+    /// Status of the entry: "permanent", "expired", "expires in …" or "unknown"; IPv6 entries are prefixed with the ND state ("stale, …")
     let status: String
     
     /// Link type as printed by `arp` ("ethernet", "bridge", …); empty when `arp` prints none
