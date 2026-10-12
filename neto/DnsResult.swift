@@ -57,8 +57,10 @@ struct DnsResult: Identifiable {
     /// Whole answer in dig's text layout (sections, query time, server), for copying
     var digText: String {
         guard let message else { return ";; \(error ?? "")" }
-        var lines = [";; ->>HEADER<<- status: \(message.rcodeName), id: \(message.id)",
-                     ";; flags: \(message.flagNames.joined(separator: " ")); QUERY: \(message.questions.count), ANSWER: \(message.answers.count), AUTHORITY: \(message.authority.count), ADDITIONAL: \(message.additional.count)",
+        // dig counts the EDNS OPT pseudo-record in ADDITIONAL
+        let additionalCount = message.additional.count + (message.ednsUDPSize == nil ? 0 : 1)
+        var lines = [";; ->>HEADER<<- opcode: QUERY, status: \(message.rcodeName), id: \(message.id)",
+                     ";; flags: \(message.flagNames.joined(separator: " ")); QUERY: \(message.questions.count), ANSWER: \(message.answers.count), AUTHORITY: \(message.authority.count), ADDITIONAL: \(additionalCount)",
                      "",
                      ";; QUESTION SECTION:"]
         lines += message.questions.map { ";\($0.name)\t\tIN\t\(DNSRecordType.name(of: $0.type))" }

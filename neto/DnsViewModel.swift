@@ -34,6 +34,8 @@ final class DnsViewModel: ObservableObject {
 
     private let dnsManager = DnsManager()
     private var lookupTask: Task<Void, Never>?
+    /// Identifies the current lookup, so a late result of a stopped one cannot replace a newer one
+    private var currentLookupID: UUID?
 
     init(systemServers: [String] = DnsManager.systemServers()) {
         self.systemServers = systemServers
@@ -61,11 +63,11 @@ final class DnsViewModel: ObservableObject {
         }
     }
 
-    /// Whether the name can be encoded: labels of 1-63 bytes, at most 253 characters
+    /// Whether the name can be sent: a host name (internationalised names become punycode) whose wire form fits
+    /// the DNS limits (labels of 1-63 bytes, 255 bytes in total)
     var isQueryValid: Bool {
-        let name = effectiveQuery.name
-        guard !name.isEmpty, (try? DNSWire.encodeName(name)) != nil else { return false }
-        return name.count <= 254
+        guard let wireName = DNSWire.asciiName(effectiveQuery.name) else { return false }
+        return (try? DNSWire.encodeName(wireName)) != nil
     }
 
     var canLookup: Bool {
@@ -83,7 +85,10 @@ final class DnsViewModel: ObservableObject {
         isLoading = true
         errorMessage = nil
         result = nil
+        let lookupID = UUID()
+        currentLookupID = lookupID
         lookupTask = dnsManager.performLookup(name: name, type: type, server: server, transport: transport) { [weak self] result in
+            guard self?.currentLookupID == lookupID else { return }
             self?.result = result
             self?.isLoading = false
             self?.lookupTask = nil
@@ -95,6 +100,7 @@ final class DnsViewModel: ObservableObject {
     func stopLookup() {
         lookupTask?.cancel()
         lookupTask = nil
+        currentLookupID = nil
         isLoading = false
     }
 

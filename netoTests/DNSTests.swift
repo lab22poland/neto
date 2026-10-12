@@ -164,3 +164,101 @@ struct DnsViewModelTests {
         #expect(!viewModel.canLookup)
     }
 }
+
+/// Hardening and dig-compatibility cases found in review
+struct DNSWireReviewTests {
+
+    private static func message(answer: [UInt8], type: UInt16 = 1, rdata: [UInt8], flags: UInt16 = 0x8180, opt: [UInt8] = []) -> [UInt8] {
+        // header (1 question, 1 answer, optional OPT), question "a." A IN, answer with the given owner bytes
+        var m: [UInt8] = [0, 1, UInt8(flags >> 8), UInt8(flags & 0xFF), 0, 1, 0, 1, 0, 0, 0, opt.isEmpty ? 0 : 1]
+        m += [1, 0x61, 0, 0, 1, 0, 1]
+        m += answer + [UInt8(type >> 8), UInt8(type & 0xFF), 0, 1, 0, 0, 0, 60, UInt8(rdata.count >> 8), UInt8(rdata.count & 0xFF)] + rdata
+        return m + opt
+    }
+
+    @Test func rrsigIsPresentedLikeDig() throws {
+        let hex = "9f7081a000010003000000010a636c6f7564666c61726503636f6d0000010001c00c000100010000012c0004681084e5c00c000100010000012c0004681085e5c00c002e00010000012c006200010d020000012c6ace363a6acb771a86c90a636c6f7564666c61726503636f6d00ba6046021e1061541a7f76d0e998bcef2d0eaa16c1c59f7941f578a5d866947315f86fe2055aa2dfd245dc370aba84dc1e2344b274dfa4d8063d61fd47e9a56100002904d0000080000000"
+        var bytes: [UInt8] = []
+        var index = hex.startIndex
+        while index < hex.endIndex { let next = hex.index(index, offsetBy: 2); bytes.append(UInt8(hex[index..<next], radix: 16)!); index = next }
+        let rrsig = try #require(try DNSWire.parse(bytes).answers.first { $0.typeName == "RRSIG" })
+        // Fields decoded independently from the captured bytes; layout as `dig +dnssec` prints it
+        #expect(rrsig.data == "A 13 2 300 20261013134634 20261011114634 34505 cloudflare.com. umBGAh4QYVQaf3bQ6Zi87y0OqhbBxZ95QfV4pdhmlHMV+G/iBVqi39JF3DcKuoTcHiNEsnTfpNgGPWH9R+mlYQ==")
+    }
+
+    @Test func labelsAreEscapedLikeDig() throws {
+        // owner label a"b(c)d;e@f$g h  →  dig: a\"b\(c\)d\;e\@f\$g\032h
+        let label = Array("a\"b(c)d;e@f$g h".utf8)
+        let owner = [UInt8(label.count)] + label + [0]
+        let record = try #require(try DNSWire.parse(Self.message(answer: owner, rdata: [1, 2, 3, 4])).answers.first)
+        #expect(record.name == "a\\\"b\\(c\\)d\\;e\\@f\\$g\\032h.")
+    }
+
+    @Test func forwardCompressionPointerIsRejected() {
+        // the answer owner points forward, past itself
+        #expect(throws: DNSMessageError.self) { try DNSWire.parse(Self.message(answer: [0xC0, 40], rdata: [1, 2, 3, 4])) }
+    }
+
+    @Test func nameInRdataMustEndInsideTheRecord() {
+        // MX: preference 10, then a name whose terminating zero lies beyond RDLENGTH
+        let mx: [UInt8] = [0, 10, 3, 0x61, 0x62, 0x63]
+        var message = Self.message(answer: [0xC0, 12], type: 15, rdata: mx)
+        message += [0]
+        #expect(throws: DNSMessageError.self) { try DNSWire.parse(message) }
+    }
+
+    @Test func wrongAddressLengthIsMalformed() {
+        #expect(throws: DNSMessageError.self) { try DNSWire.parse(Self.message(answer: [0xC0, 12], rdata: [1, 2, 3])) }
+    }
+
+    @Test func extendedRCODEFromOPT() throws {
+        // OPT with extended RCODE 1 in the TTL's top byte and header RCODE 0 → 16 = BADVERS (RFC 6891)
+        let opt: [UInt8] = [0, 0, 41, 0x04, 0xD0, 0x01, 0, 0, 0, 0, 0]
+        let parsed = try DNSWire.parse(Self.message(answer: [0xC0, 12], rdata: [1, 2, 3, 4], opt: opt))
+        #expect(parsed.rcodeName == "BADVERS")
+    }
+
+    @Test(arguments: [(UInt16(1), "IN"), (3, "CH"), (4, "HS"), (254, "NONE"), (255, "ANY"), (7, "CLASS7")])
+    func classNamesLikeDig(value: UInt16, name: String) {
+        #expect(DNSWire.className(value) == name)
+    }
+
+    @Test(arguments: [("ząb.pl", "xn--zb-pla.pl"), ("bücher.de.", "xn--bcher-kva.de."), ("_imaps._tcp.gmail.com", "_imaps._tcp.gmail.com"),
+                      ("8.8.8.8.in-addr.arpa.", "8.8.8.8.in-addr.arpa."), (".", ".")])
+    func internationalNamesBecomePunycode(name: String, wire: String) {
+        #expect(DNSWire.asciiName(name) == wire)
+    }
+
+    @Test(arguments: ["a b.com", "https://example.com", ""])
+    func nonHostNamesAreRejected(_ name: String) {
+        #expect(DNSWire.asciiName(name) == nil)
+    }
+
+    @Test func responsesMustMatchTheQuery() throws {
+        let query = try DNSWire.query(name: "example.com", type: 1, id: 0x1234)
+        var response = query
+        response[2] |= 0x80   // QR
+        #expect(DNSWire.isResponse(response, to: query))
+
+        var upper = response
+        upper[13] = 0x45      // "Example.com": names compare case-insensitively
+        #expect(DNSWire.isResponse(upper, to: query))
+
+        var otherID = response
+        otherID[1] = 0x35
+        #expect(!DNSWire.isResponse(otherID, to: query), "ID mismatch")
+
+        var otherType = response
+        otherType[26] = 28    // AAAA instead of A
+        #expect(!DNSWire.isResponse(otherType, to: query), "question section mismatch")
+
+        #expect(!DNSWire.isResponse(query, to: query), "a query (QR=0) is not a response")
+    }
+
+    @Test func truncationIsReadFromTheHeader() throws {
+        // a truncated answer that does not parse still reports TC
+        let broken: [UInt8] = [0, 1, 0x83, 0x80, 0, 1, 0, 3, 0, 0, 0, 0, 1, 0x61, 0, 0, 1, 0, 1, 0xC0]
+        #expect(throws: DNSMessageError.self) { try DNSWire.parse(broken) }
+        #expect(DNSWire.header(broken).map { $0.flags & 0x0200 != 0 } == true)
+    }
+}

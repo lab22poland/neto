@@ -57,6 +57,9 @@ struct DnsView: View {
             TextField("Enter a domain name, or an IP address for a reverse lookup", text: $viewModel.query)
                 .textFieldStyle(.roundedBorder)
                 .disableAutocorrection(true)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
                 .accessibilityIdentifier("dns.name")
                 .onSubmit {
                     if viewModel.canLookup { viewModel.startLookup() }
@@ -69,7 +72,7 @@ struct DnsView: View {
                     }
                 }
                 .fixedSize()
-                .disabled(DNSWire.reverseName(for: viewModel.query.trimmingCharacters(in: .whitespaces)) != nil)
+                .disabled(viewModel.effectiveQuery.type == .ptr && DNSWire.reverseName(for: viewModel.query.trimmingCharacters(in: .whitespacesAndNewlines)) != nil)
                 .accessibilityIdentifier("dns.type")
 
                 if viewModel.effectiveQuery.type == .ptr && viewModel.recordType != .ptr {

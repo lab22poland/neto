@@ -62,8 +62,8 @@ final class DnsManager {
     ///   - type: Record type
     ///   - server: Server to ask
     ///   - transport: How to reach the server
-    ///   - ednsUDPSize: UDP payload size announced in EDNS0 (dig's default 1232); a smaller one forces truncation
-    ///   - onResult: Called on the main actor exactly once
+    ///   - ednsUDPSize: UDP payload size announced in EDNS0 (dig's default since 9.16 is 1232); a smaller one forces truncation
+    ///   - onResult: Called on the main actor once, unless the task is cancelled first
     /// - Returns: A Task that can be cancelled
     func performLookup(
         name: String,
@@ -75,8 +75,10 @@ final class DnsManager {
     ) -> Task<Void, Never> {
         Task {
             let result = await lookup(name: name, type: type, server: server, transport: transport, ednsUDPSize: ednsUDPSize)
-            if Task.isCancelled { return }
-            await MainActor.run { onResult(result) }
+            await MainActor.run {
+                // Checked on the main actor, so a Stop issued before this point always wins
+                if !Task.isCancelled { onResult(result) }
+            }
         }
     }
 
@@ -85,17 +87,17 @@ final class DnsManager {
         do {
             // DoH recommends ID 0 so responses are cacheable (RFC 8484 4.1)
             let id = transport == .https ? 0 : UInt16.random(in: 0...UInt16.max)
-            let query = try DNSWire.query(name: name, type: type.rawValue, id: id, ednsUDPSize: ednsUDPSize)
+            guard let wireName = DNSWire.asciiName(name) else { throw DNSMessageError.invalidName(name) }
+            let query = try DNSWire.query(name: wireName, type: type.rawValue, id: id, ednsUDPSize: ednsUDPSize)
             var exchange = try await send(query, to: server, over: transport)
             var usedTransport = transport
-            var message = try DNSWire.parse(exchange.response)
-            if transport == .udp, message.isTruncated {
+            // Truncation is read from the raw header: the rest of a truncated answer may not parse
+            if transport == .udp, let header = DNSWire.header(exchange.response), header.flags & 0x0200 != 0 {
                 // RFC 7766: a truncated UDP answer is retried over TCP, like dig
                 exchange = try await send(query, to: server, over: .tcp)
-                message = try DNSWire.parse(exchange.response)
                 usedTransport = .tcp
             }
-            guard message.id == id, message.isResponse else { throw DNSLookupError.mismatchedResponse }
+            let message = try DNSWire.parse(exchange.response)
             return DnsResult(name: name, type: type, server: server, transport: usedTransport, message: message,
                              queryTime: exchange.milliseconds, responseSize: exchange.response.count, timestamp: started)
         } catch {
@@ -106,22 +108,28 @@ final class DnsManager {
 
     /// One query/response exchange; the time is measured from sending to the complete response, like dig's "Query time"
     private func send(_ query: [UInt8], to server: DNSServer, over transport: DNSTransport) async throws -> (response: [UInt8], milliseconds: Double) {
+        let accept = { (response: [UInt8]) in DNSWire.isResponse(response, to: query) }
         switch transport {
         case .udp:
-            return try await exchange(query, host: server.address, port: 53, parameters: .udp, framed: false)
+            return try await exchange(query, host: server.address, port: 53, parameters: .udp, framed: false, accept: accept)
         case .tcp:
-            return try await exchange(query, host: server.address, port: 53, parameters: .tcp, framed: true)
+            return try await exchange(query, host: server.address, port: 53, parameters: .tcp, framed: true, accept: accept)
         case .tls:
             guard let host = server.tlsHost else { throw DNSLookupError.unsupportedTransport(transport, server.label) }
-            return try await exchange(query, host: host, port: 853, parameters: .tls, framed: true)
+            return try await exchange(query, host: host, port: 853, parameters: .tls, framed: true, accept: accept)
         case .https:
             guard let url = server.dohURL else { throw DNSLookupError.unsupportedTransport(transport, server.label) }
-            return try await httpsExchange(query, url: url)
+            let exchange = try await httpsExchange(query, url: url)
+            guard accept(exchange.response) else { throw DNSLookupError.mismatchedResponse }
+            return exchange
         }
     }
 
-    /// UDP datagram, or TCP/TLS with the 2-byte length prefix (RFC 1035 4.2.2, RFC 7858)
-    private func exchange(_ query: [UInt8], host: String, port: UInt16, parameters: NWParameters, framed: Bool) async throws -> (response: [UInt8], milliseconds: Double) {
+    /// UDP datagram, or TCP/TLS with the 2-byte length prefix (RFC 1035 4.2.2, RFC 7858).
+    /// Over UDP, datagrams that do not answer the query (other ID or question) are ignored like dig does;
+    /// over a stream the single answer must match.
+    private func exchange(_ query: [UInt8], host: String, port: UInt16, parameters: NWParameters, framed: Bool,
+                          accept: @escaping ([UInt8]) -> Bool) async throws -> (response: [UInt8], milliseconds: Double) {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw DNSLookupError.invalidServer(host) }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: parameters)
         let completion = DNSCompletion()
@@ -129,8 +137,19 @@ final class DnsManager {
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                completion.set(continuation) { connection.cancel() }
+                // Already cancelled: the continuation was resumed, don't start the connection
+                guard completion.set(continuation, cleanup: { connection.cancel() }) else { return }
                 let clock = QueryClock()
+                func receiveDatagram() {
+                    connection.receiveMessage { data, _, _, error in
+                        guard let data else { completion.finish(.failure(error ?? DNSLookupError.noResponse)); return }
+                        if accept([UInt8](data)) {
+                            completion.finish(.success(([UInt8](data), elapsed())))
+                        } else {
+                            receiveDatagram()   // spoofed or stale datagram: keep waiting until the timeout
+                        }
+                    }
+                }
                 func elapsed() -> Double { clock.milliseconds }
 
                 connection.stateUpdateHandler = { state in
@@ -147,22 +166,18 @@ final class DnsManager {
                                     completion.finish(.failure(error ?? DNSLookupError.noResponse)); return
                                 }
                                 let length = Int(header[header.startIndex]) << 8 | Int(header[header.startIndex + 1])
+                                guard length > 0 else { completion.finish(.failure(DNSLookupError.noResponse)); return }
                                 connection.receive(minimumIncompleteLength: length, maximumLength: length) { body, _, _, error in
                                     if let body, body.count == length {
-                                        completion.finish(.success(([UInt8](body), elapsed())))
+                                        let response = [UInt8](body)
+                                        completion.finish(accept(response) ? .success((response, elapsed())) : .failure(DNSLookupError.mismatchedResponse))
                                     } else {
                                         completion.finish(.failure(error ?? DNSLookupError.noResponse))
                                     }
                                 }
                             }
                         } else {
-                            connection.receiveMessage { data, _, _, error in
-                                if let data {
-                                    completion.finish(.success(([UInt8](data), elapsed())))
-                                } else {
-                                    completion.finish(.failure(error ?? DNSLookupError.noResponse))
-                                }
-                            }
+                            receiveDatagram()
                         }
                     case .waiting(let error), .failed(let error):
                         completion.finish(.failure(error))
@@ -194,6 +209,9 @@ final class DnsManager {
         let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw DNSLookupError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        guard http.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("application/dns-message") == true else {
+            throw DNSLookupError.notDNSMessage(http.value(forHTTPHeaderField: "Content-Type") ?? "none")
         }
         return ([UInt8](data), milliseconds)
     }
@@ -237,7 +255,15 @@ final class DnsManager {
             var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
             switch family {
             case AF_INET: return inet_ntop(AF_INET, entry + 4, &text, socklen_t(text.count)).map { _ in String(cString: text) }
-            case AF_INET6: return inet_ntop(AF_INET6, entry + 8, &text, socklen_t(text.count)).map { _ in String(cString: text) }
+            case AF_INET6:
+                guard inet_ntop(AF_INET6, entry + 8, &text, socklen_t(text.count)) != nil else { return nil }
+                // A link-local server needs its zone (sin6_scope_id at offset 24), e.g. fe80::1%en0
+                let scope = entry.load(fromByteOffset: 24, as: UInt32.self)
+                var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+                if scope != 0, if_indextoname(scope, &name) != nil {
+                    return String(cString: text) + "%" + String(cString: name)
+                }
+                return String(cString: text)
             default: return nil
             }
         }
@@ -264,6 +290,7 @@ enum DNSLookupError: LocalizedError {
     case invalidServer(String)
     case unsupportedTransport(DNSTransport, String)
     case httpStatus(Int)
+    case notDNSMessage(String)
 
     var errorDescription: String? {
         switch self {
@@ -273,6 +300,7 @@ enum DNSLookupError: LocalizedError {
         case .invalidServer(let host): return "Invalid server: \(host)"
         case .unsupportedTransport(let transport, let server): return "\(server) does not support \(transport.rawValue)"
         case .httpStatus(let status): return "DoH server answered HTTP \(status)"
+        case .notDNSMessage(let type): return "DoH server answered with \(type) instead of application/dns-message"
         }
     }
 }
@@ -302,18 +330,21 @@ private final class DNSCompletion: @unchecked Sendable {
     private var cleanup: (() -> Void)?
     private var pending: Result<(response: [UInt8], milliseconds: Double), Error>?
 
-    func set(_ continuation: CheckedContinuation<(response: [UInt8], milliseconds: Double), Error>, cleanup: @escaping () -> Void) {
+    /// Returns false if the operation already finished (cancelled early); the continuation is resumed then
+    @discardableResult
+    func set(_ continuation: CheckedContinuation<(response: [UInt8], milliseconds: Double), Error>, cleanup: @escaping () -> Void) -> Bool {
         lock.lock()
         if let pending {
             self.pending = nil
             lock.unlock()
             cleanup()
             continuation.resume(with: pending)
-            return
+            return false
         }
         self.continuation = continuation
         self.cleanup = cleanup
         lock.unlock()
+        return true
     }
 
     func finish(_ result: Result<(response: [UInt8], milliseconds: Double), Error>) {
