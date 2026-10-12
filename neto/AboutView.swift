@@ -80,6 +80,14 @@ struct AboutView: View {
                             Text("WHOIS Tool - RFC 3912 compliant queries for domains, IP addresses, AS numbers, and person/organization records (FreeBSD compatible)")
                         }
                         .font(.body)
+                        
+                        HStack {
+                            Image(systemName: "table")
+                                .foregroundColor(.primary)
+                                .frame(width: 20)
+                            Text("ARP Browser - IPv4 ARP and IPv6 neighbor tables, like arp -an and ndp -an (macOS)")
+                        }
+                        .font(.body)
                     }
                 }
                 

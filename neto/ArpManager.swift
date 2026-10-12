@@ -7,68 +7,30 @@
 //
 
 import Foundation
-import Network
-import SystemConfiguration
 #if os(macOS)
 import Darwin
 #endif
 
-/// Manager class responsible for ARP table operations across all platforms
-/// 
-/// This implementation provides cross-platform access to network neighbor information
-/// using BSD system APIs that are available on both macOS and iOS/iPadOS:
-/// - Uses `getifaddrs()` to enumerate network interfaces and their MAC addresses
-/// - Uses `sysctl()` to access the routing table and neighbor cache
-/// - Parses routing messages to extract ARP/NDP entries
+/// Reads the neighbor tables: IPv4 ARP (like `arp -an`) and IPv6 neighbor discovery (like `ndp -an`).
 ///
-/// This approach works within app sandbox constraints by using only
-/// approved BSD networking APIs available to all Darwin-based platforms.
+/// On macOS both come from the routing table via `sysctl(NET_RT_FLAGS, RTF_LLINFO)`, parsed the way
+/// FreeBSD/Darwin `arp` and `ndp` do it. iOS/iPadOS does not expose the routing table to apps.
 final class ArpManager {
     
-    // MARK: - BSD Constants and Structures
-    private let RTAX_MAX: Int32 = 8
-    private let RTAX_DST: Int32 = 0
-    private let RTAX_GATEWAY: Int32 = 1
-    private let RTF_LLINFO: Int32 = 0x400
-    private let NET_RT_FLAGS: Int32 = 1
-    private let RTF_STATIC: Int32 = 0x800
-    private let RTF_WASCLONED: Int32 = 0x20000
-    private let AF_LINK: Int32 = 18
-    
-    /// Helper struct to represent network interface information
-    private struct NetworkInterface {
-        let name: String
-        let family: AddressFamily
-        let flags: UInt32
-        let ipAddress: String?
-        let macAddress: String?
-        
-        enum AddressFamily {
-            case ipv4, ipv6, link
-        }
-    }
-    
-    /// Retrieves the current ARP table from the system
-    /// 
-    /// - Returns: ArpResult containing all ARP entries grouped by interface
+    /// Retrieves the current ARP (IPv4) and NDP (IPv6) neighbor tables from the system
+    /// - Returns: ArpResult containing all entries grouped by interface
     /// - Throws: ArpError if the operation fails
-    /// 
-    /// **Implementation Notes:**
-    /// - Uses BSD system APIs for cross-platform compatibility
-    /// - Works on both macOS and iOS/iPadOS within sandbox constraints
-    /// - Returns neighbor cache entries when available, or interface information as fallback
     func getArpTable() async throws -> ArpResult {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     #if os(macOS)
-                    let entries = try self.getNeighborCacheEntries()
+                    let entries = try Self.readNeighborTable(family: AF_INET) + Self.readNeighborTable(family: AF_INET6)
                     #else
                     // On iOS/iPadOS, we can only get basic interface information
-                    let entries = try self.getBasicInterfaceEntries()
+                    let entries = try Self.getBasicInterfaceEntries()
                     #endif
-                    let result = ArpResult(entries: entries)
-                    continuation.resume(returning: result)
+                    continuation.resume(returning: ArpResult(entries: entries))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -76,326 +38,211 @@ final class ArpManager {
         }
     }
     
-    // MARK: - Core Implementation
-    
     #if os(macOS)
-    /// Retrieves neighbor cache entries using BSD sysctl APIs
-    private func getNeighborCacheEntries() throws -> [ArpEntry] {
-        var entries: [ArpEntry] = []
-        
-        // Get network interfaces with their MAC addresses
-        let interfaces = try getNetworkInterfaces()
-        
-        // First, add interface entries showing the MAC addresses of local interfaces
-        entries.append(contentsOf: createInterfaceEntries(interfaces))
-        
-        // Then try to get neighbor entries from routing table
-        for interface in interfaces.filter({ $0.family != .link }) {
-            do {
-                let neighborEntries = try getNeighborEntriesForInterface(interface)
-                entries.append(contentsOf: neighborEntries)
-            } catch {
-                // Continue with other interfaces if one fails
-                print("Debug: Failed to get neighbor entries for interface \(interface.name): \(error)")
-                continue
-            }
-        }
-        
-        return entries
-    }
+    // MARK: - Routing Table (macOS)
     
-    /// Creates entries showing network interface information including MAC addresses
-    private func createInterfaceEntries(_ interfaces: [NetworkInterface]) -> [ArpEntry] {
-        var entries: [ArpEntry] = []
-        
-        // Group interfaces by name to combine IP and MAC information
-        let interfaceGroups = Dictionary(grouping: interfaces) { $0.name }
-        
-        for (interfaceName, interfaceList) in interfaceGroups {
-            // Skip loopback interfaces
-            if interfaceName.hasPrefix("lo") { continue }
-            
-            // Find the link-layer interface (has MAC address)
-            let linkInterface = interfaceList.first { $0.family == .link }
-            let ipInterfaces = interfaceList.filter { $0.family != .link }
-            
-            guard let macAddress = linkInterface?.macAddress else { continue }
-            
-            // Create entries for each IP address on this interface
-            if !ipInterfaces.isEmpty {
-                for ipInterface in ipInterfaces {
-                    if let ipAddress = ipInterface.ipAddress {
-                        let entry = ArpEntry(
-                            ipAddress: ipAddress,
-                            macAddress: macAddress,
-                            interface: interfaceName,
-                            status: "interface"
-                        )
-                        entries.append(entry)
-                    }
-                }
-            } else {
-                // Interface with MAC but no IP configured
-                let entry = ArpEntry(
-                    ipAddress: "N/A",
-                    macAddress: macAddress,
-                    interface: interfaceName,
-                    status: "interface"
-                )
-                entries.append(entry)
-            }
-        }
-        
-        return entries
-    }
-    
-    /// Gets network interface information using getifaddrs, including MAC addresses
-    private func getNetworkInterfaces() throws -> [NetworkInterface] {
-        var ifaddrs: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddrs) == 0 else {
-            throw ArpError.systemCallFailed("getifaddrs failed")
-        }
-        defer { freeifaddrs(ifaddrs) }
-        
-        var interfaces: [NetworkInterface] = []
-        var current = ifaddrs
-        
-        while current != nil {
-            defer { current = current?.pointee.ifa_next }
-            
-            guard let ifa = current?.pointee,
-                  let name = ifa.ifa_name,
-                  let addr = ifa.ifa_addr else { continue }
-            
-            let interfaceName = String(cString: name)
-            let flags = ifa.ifa_flags
-            
-            // Skip inactive interfaces, but allow loopback for now (we'll filter later)
-            guard (flags & UInt32(IFF_UP)) != 0 else { continue }
-            
-            var networkInterface: NetworkInterface?
-            
-            // Process different address families
-            switch addr.pointee.sa_family {
-            case UInt8(AF_INET), UInt8(AF_INET6):
-                // IP addresses
-                let ipAddress = parseSocketAddress(UnsafeMutablePointer(mutating: addr))
-                networkInterface = NetworkInterface(
-                    name: interfaceName,
-                    family: addr.pointee.sa_family == UInt8(AF_INET) ? .ipv4 : .ipv6,
-                    flags: flags,
-                    ipAddress: ipAddress,
-                    macAddress: nil
-                )
-                
-            case UInt8(AF_LINK):
-                // Link-layer addresses (MAC addresses)
-                let macAddress = parseLinkLayerAddress(UnsafeMutablePointer(mutating: addr))
-                networkInterface = NetworkInterface(
-                    name: interfaceName,
-                    family: .link,
-                    flags: flags,
-                    ipAddress: nil,
-                    macAddress: macAddress
-                )
-                
-            default:
-                continue
-            }
-            
-            if let interface = networkInterface {
-                interfaces.append(interface)
-            }
-        }
-        
-        return interfaces
-    }
-    
-    /// Gets neighbor entries for a specific interface using routing table access
-    private func getNeighborEntriesForInterface(_ interface: NetworkInterface) throws -> [ArpEntry] {
-        var entries: [ArpEntry] = []
-        
-        // Use sysctl to access routing table with neighbor discovery information
-        let mib: [Int32] = [CTL_NET, PF_ROUTE, 0, interface.family == .ipv4 ? AF_INET : AF_INET6, NET_RT_FLAGS, RTF_LLINFO]
-        
+    /// Dumps the link-layer entries of one address family from the routing table
+    static func readNeighborTable(family: Int32) throws -> [ArpEntry] {
+        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_LLINFO]
         var size = 0
-        let result = mib.withUnsafeBufferPointer { mibPtr in
-            sysctl(UnsafeMutablePointer(mutating: mibPtr.baseAddress), UInt32(mib.count), nil, &size, nil, 0)
+        guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0 else {
+            throw ArpError.systemCallFailed("sysctl size: \(String(cString: strerror(errno)))")
         }
-        guard result == 0 else {
-            // Routing table access not available, return empty array
-            return entries
+        guard size > 0 else { return [] }
+        // The table can grow between the two calls
+        size += size / 8
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, UInt32(mib.count), &buffer, &size, nil, 0) == 0 else {
+            throw ArpError.systemCallFailed("sysctl dump: \(String(cString: strerror(errno)))")
         }
-        
-        guard size > 0 else {
-            // No routing entries available
-            return entries
-        }
-        
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
-        defer { buffer.deallocate() }
-        
-        let result2 = mib.withUnsafeBufferPointer { mibPtr in
-            sysctl(UnsafeMutablePointer(mutating: mibPtr.baseAddress), UInt32(mib.count), buffer, &size, nil, 0)
-        }
-        guard result2 == 0 else {
-            // Failed to read routing table data
-            return entries
-        }
-        
-        // Parse routing messages with error handling
-        do {
-            entries = try parseRoutingMessages(buffer: buffer, size: size, interface: interface)
-        } catch {
-            // If parsing fails, we'll continue without neighbor entries
-            print("Debug: Failed to parse routing messages for \(interface.name): \(error)")
-        }
-        
-        return entries
+        var now = timeval()
+        gettimeofday(&now, nil)
+        let ndSocket = family == AF_INET6 ? socket(AF_INET6, SOCK_DGRAM, 0) : -1
+        defer { if ndSocket >= 0 { close(ndSocket) } }
+        return parseNeighborTable(Array(buffer.prefix(size)), now: Int(now.tv_sec), interfaceName: { index in
+            var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+            return if_indextoname(UInt32(index), &name) != nil ? String(cString: name) : "if\(index)"
+        }, neighborInfo: { address, interface in
+            ndSocket >= 0 ? neighborDiscoveryInfo(socket: ndSocket, address: address, interface: interface) : nil
+        })
     }
     
-    /// Parses routing messages to extract neighbor cache entries
-    private func parseRoutingMessages(buffer: UnsafeMutableRawPointer, size: Int, interface: NetworkInterface) throws -> [ArpEntry] {
+    /// IPv6 neighbor state from the kernel (what `ndp` shows), via ioctl(SIOCGNBRINFO_IN6)
+    struct NeighborInfo: Equatable {
+        /// ND6_LLINFO_* state: 0 incomplete, 1 reachable, 2 stale, 3 delay, 4 probe
+        let state: Int32
+        /// Expiry in seconds since 1970, 0 = never
+        let expire: Int
+    }
+    
+    /// Mirror of `struct in6_nbrinfo` (netinet6/nd6.h, not imported into Swift)
+    private struct In6NeighborInfo {
+        var ifname: (CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
+                     CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        var addr = in6_addr()
+        var asked: Int = 0
+        var isrouter: Int32 = 0
+        var state: Int32 = 0
+        var expire: Int32 = 0
+    }
+    
+    private static func neighborDiscoveryInfo(socket: Int32, address: String, interface: String) -> NeighborInfo? {
+        var info = In6NeighborInfo()
+        guard inet_pton(AF_INET6, address, &info.addr) == 1 else { return nil }
+        withUnsafeMutableBytes(of: &info.ifname) { raw in
+            for (index, byte) in interface.utf8.prefix(Int(IFNAMSIZ) - 1).enumerated() { raw[index] = byte }
+        }
+        // The kernel expects link-local addresses with the interface index embedded in bytes 2-3 (KAME)
+        let index = if_nametoindex(interface)
+        withUnsafeMutableBytes(of: &info.addr) { raw in
+            if raw[0] == 0xfe && raw[1] & 0xc0 == 0x80 {
+                raw[2] = UInt8(index >> 8)
+                raw[3] = UInt8(index & 0xff)
+            }
+        }
+        // _IOWR('i', 78, struct in6_nbrinfo); the C size includes trailing padding, i.e. the Swift stride
+        let request = UInt(0xC000_0000) | (UInt(MemoryLayout<In6NeighborInfo>.stride & 0x1fff) << 16) | (UInt(UInt8(ascii: "i")) << 8) | 78
+        guard ioctl(socket, request, &info) == 0 else { return nil }
+        return NeighborInfo(state: info.state, expire: Int(info.expire))
+    }
+    
+    /// Parses a `sysctl(NET_RT_FLAGS, RTF_LLINFO)` dump: a sequence of `rt_msghdr`, each followed by
+    /// the destination (`sockaddr_in` / `sockaddr_in6`) and the gateway (`sockaddr_dl` with the MAC).
+    /// - Parameters:
+    ///   - now: Current time in seconds since 1970 (`rmx_expire` uses the same clock)
+    ///   - interfaceName: Maps an interface index to its name
+    ///   - neighborInfo: IPv6 only – kernel state for an address on an interface; its expiry replaces `rmx_expire`, which is 0 for IPv6
+    static func parseNeighborTable(_ buffer: [UInt8], now: Int, interfaceName: (Int) -> String,
+                                   neighborInfo: (String, String) -> NeighborInfo? = { _, _ in nil }) -> [ArpEntry] {
+        let headerSize = MemoryLayout<rt_msghdr>.size
+        let flagsOffset = MemoryLayout<rt_msghdr>.offset(of: \rt_msghdr.rtm_flags)!
+        let addrsOffset = MemoryLayout<rt_msghdr>.offset(of: \rt_msghdr.rtm_addrs)!
+        let expireOffset = MemoryLayout<rt_msghdr>.offset(of: \rt_msghdr.rtm_rmx)! + MemoryLayout<rt_metrics>.offset(of: \rt_metrics.rmx_expire)!
+        
+        func load<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
+            buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) }
+        }
+        /// Socket addresses are padded to 4 bytes (Darwin ROUNDUP)
+        func roundUp(_ length: Int) -> Int { length > 0 ? 1 + ((length - 1) | 3) : 4 }
+        
         var entries: [ArpEntry] = []
         var offset = 0
-        
-        while offset < size {
-            // Ensure we don't read beyond the buffer
-            guard offset + MemoryLayout<rt_msghdr>.size <= size else { break }
+        while offset + headerSize <= buffer.count {
+            let messageLength = Int(load(UInt16.self, at: offset))
+            guard messageLength >= headerSize, offset + messageLength <= buffer.count else { break }
+            defer { offset += messageLength }
             
-            let rtm = buffer.advanced(by: offset).assumingMemoryBound(to: rt_msghdr.self)
-            let msgLen = Int(rtm.pointee.rtm_msglen)
+            let flags = load(Int32.self, at: offset + flagsOffset)
+            let addresses = load(Int32.self, at: offset + addrsOffset)
+            let expire = Int(load(Int32.self, at: offset + expireOffset))
+            guard addresses & RTA_DST != 0, addresses & RTA_GATEWAY != 0 else { continue }
             
-            // Ensure message length is reasonable
-            guard msgLen > 0 && msgLen >= MemoryLayout<rt_msghdr>.size && offset + msgLen <= size else { 
-                break 
+            let destination = offset + headerSize
+            guard destination < offset + messageLength else { continue }
+            let gateway = destination + roundUp(Int(buffer[destination]))
+            guard gateway + 8 <= offset + messageLength,
+                  let ipAddress = neighborAddress(buffer, at: destination),
+                  buffer[gateway + 1] == UInt8(AF_LINK) else { continue }
+            
+            // sockaddr_dl: len, family, index (2), type, nlen, alen, slen, then name and LLADDR = sdl_data + nlen
+            let index = Int(load(UInt16.self, at: gateway + 2))
+            let linkType = buffer[gateway + 4]
+            let nameLength = Int(buffer[gateway + 5])
+            let addressLength = Int(buffer[gateway + 6])
+            let macStart = gateway + 8 + nameLength
+            let macAddress: String
+            if addressLength > 0, macStart + addressLength <= offset + messageLength {
+                macAddress = buffer[macStart..<(macStart + addressLength)].map { String(format: "%02x", $0) }.joined(separator: ":")
+            } else {
+                macAddress = "(incomplete)"
             }
             
-            // Parse this routing message for neighbor information
-            if let entry = parseRoutingMessage(rtm: rtm, interface: interface) {
-                entries.append(entry)
+            let interface = interfaceName(index)
+            let info = buffer[destination + 1] == UInt8(AF_INET6) ? neighborInfo(ipAddress, interface) : nil
+            let effectiveExpire = info?.expire ?? expire
+            var status: String
+            if effectiveExpire == 0 {
+                status = "permanent"
+            } else if effectiveExpire <= now {
+                status = "expired"
+            } else {
+                status = "expires in \(formatDuration(effectiveExpire - now))"
             }
-            
-            offset += msgLen
+            if let info, let state = neighborStateName(info.state) {
+                status = "\(state), \(status)"
+            }
+            entries.append(ArpEntry(
+                ipAddress: ipAddress,
+                macAddress: macAddress,
+                interface: interface,
+                status: status,
+                linkType: linkTypeName(linkType),
+                isScoped: flags & RTF_IFSCOPE != 0
+            ))
         }
-        
         return entries
     }
     
-    /// Parses a single routing message to extract ARP entry information
-    private func parseRoutingMessage(rtm: UnsafeMutablePointer<rt_msghdr>, interface: NetworkInterface) -> ArpEntry? {
-        let addrs = UnsafeMutableRawPointer(rtm).advanced(by: MemoryLayout<rt_msghdr>.size)
-        let flags = rtm.pointee.rtm_flags
-        
-        // Only process entries with link-layer info
-        guard (flags & RTF_LLINFO) != 0 else { return nil }
-        
-        var ipAddress: String?
-        var macAddress: String?
-        var currentAddr = addrs
-        let addrMask = rtm.pointee.rtm_addrs
-        
-        // Parse socket addresses based on the address mask
-        for i in 0..<RTAX_MAX {
-            let addrBit = 1 << i
-            if (addrMask & Int32(addrBit)) == 0 { continue }
-            
-            let sa = currentAddr.assumingMemoryBound(to: sockaddr.self)
-            let saLen = Int(sa.pointee.sa_len)
-            
-            // Ensure we don't read beyond bounds
-            guard saLen > 0 && saLen >= MemoryLayout<sockaddr>.size else { break }
-            
-            switch Int32(i) {
-            case RTAX_DST:
-                // Destination address (IP address)
-                ipAddress = parseSocketAddress(sa)
-            case RTAX_GATEWAY:
-                // Gateway address (MAC address for neighbor entries)
-                macAddress = parseLinkLayerAddress(sa)
-            default:
-                break
+    /// Numeric IPv4/IPv6 destination; clears the KAME-embedded scope of link-local IPv6 addresses
+    private static func neighborAddress(_ buffer: [UInt8], at offset: Int) -> String? {
+        guard offset + 2 <= buffer.count else { return nil }
+        let length = Int(buffer[offset])
+        switch Int32(buffer[offset + 1]) {
+        case AF_INET where length >= 8 && offset + 8 <= buffer.count:
+            return buffer[(offset + 4)..<(offset + 8)].map(String.init).joined(separator: ".")
+        case AF_INET6 where length >= 24 && offset + 24 <= buffer.count:
+            var address = Array(buffer[(offset + 8)..<(offset + 24)])
+            let isLinkLocal = address[0] == 0xfe && address[1] & 0xc0 == 0x80
+            let isLinkLocalMulticast = address[0] == 0xff && address[1] & 0x0f == 0x02
+            if isLinkLocal || isLinkLocalMulticast {
+                address[2] = 0
+                address[3] = 0
             }
-            
-            // Move to next address (align to pointer boundary)
-            let alignedLen = (saLen + 3) & ~3
-            currentAddr = currentAddr.advanced(by: max(alignedLen, MemoryLayout<sockaddr>.size))
-        }
-        
-        guard let ip = ipAddress, let mac = macAddress else { return nil }
-        
-        // Determine status based on flags
-        let status: String
-        if (flags & RTF_STATIC) != 0 {
-            status = "permanent"
-        } else if (flags & RTF_WASCLONED) != 0 {
-            status = "active"
-        } else {
-            status = "reachable"
-        }
-        
-        return ArpEntry(
-            ipAddress: ip,
-            macAddress: mac,
-            interface: interface.name,
-            status: status
-        )
-    }
-    
-    /// Parses a socket address to extract IP address string
-    private func parseSocketAddress(_ sa: UnsafeMutablePointer<sockaddr>) -> String? {
-        switch sa.pointee.sa_family {
-        case UInt8(AF_INET):
-            let sin = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-            var addr = sin.sin_addr
-            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
-            return String(cString: buffer)
-            
-        case UInt8(AF_INET6):
-            let sin6 = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
-            var addr = sin6.sin6_addr
-            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-            guard inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil else { return nil }
-            return String(cString: buffer)
-            
+            var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            return address.withUnsafeBytes { raw in
+                inet_ntop(AF_INET6, raw.baseAddress, &text, socklen_t(text.count)) != nil ? String(cString: text) : nil
+            }
         default:
             return nil
         }
     }
     
-    /// Parses a link-layer address to extract MAC address string
-    func parseLinkLayerAddress(_ sa: UnsafeMutablePointer<sockaddr>) -> String? {
-        guard sa.pointee.sa_family == UInt8(AF_LINK) else { return nil }
-        
-        // Cast to sockaddr_dl to access the structure properly
-        let sdl = sa.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { $0.pointee }
-        let addrLen = Int(sdl.sdl_alen)
-        
-        // Standard Ethernet MAC address should be 6 bytes
-        guard addrLen == 6 else { return nil }
-        
-        // Calculate the offset to the link-layer address
-        // It comes after the sockaddr_dl structure and the interface name
-        let nameLen = Int(sdl.sdl_nlen)
-        let baseOffset = MemoryLayout<sockaddr_dl>.size
-        let lladdr = UnsafeMutableRawPointer(sa).advanced(by: baseOffset + nameLen)
-        let macBytes = lladdr.assumingMemoryBound(to: UInt8.self)
-        
-        // Convert bytes to hex string
-        var macParts: [String] = []
-        for i in 0..<addrLen {
-            macParts.append(String(format: "%02x", macBytes[i]))
+    /// Link type label as printed by `arp` (net/if_types.h)
+    static func linkTypeName(_ type: UInt8) -> String {
+        switch Int32(type) {
+        case IFT_BRIDGE: return "bridge"
+        case IFT_L2VLAN: return "vlan"
+        case IFT_IEEE1394: return "firewire"
+        case IFT_CELLULAR: return "cellular"
+        default: return "ethernet"
         }
-        
-        return macParts.joined(separator: ":")
+    }
+    
+    /// ND6_LLINFO_* state names (netinet6/nd6.h)
+    static func neighborStateName(_ state: Int32) -> String? {
+        switch state {
+        case 0: return "incomplete"
+        case 1: return "reachable"
+        case 2: return "stale"
+        case 3: return "delay"
+        case 4: return "probe"
+        default: return nil
+        }
+    }
+    
+    /// "23h59m28s", "44s"
+    static func formatDuration(_ seconds: Int) -> String {
+        let hours = seconds / 3600, minutes = seconds % 3600 / 60, rest = seconds % 60
+        if hours > 0 { return "\(hours)h\(minutes)m\(rest)s" }
+        if minutes > 0 { return "\(minutes)m\(rest)s" }
+        return "\(rest)s"
     }
     #endif
     
     #if !os(macOS)
     /// Retrieves basic interface information for iOS/iPadOS
     /// Note: iOS/iPadOS sandbox restrictions limit access to detailed ARP information
-    private func getBasicInterfaceEntries() throws -> [ArpEntry] {
+    private static func getBasicInterfaceEntries() throws -> [ArpEntry] {
         var entries: [ArpEntry] = []
         
         // On iOS/iPadOS, we can only get basic network interface information

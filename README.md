@@ -173,13 +173,13 @@ See [LICENSE](LICENSE) file for complete license terms.
 - **Ping Tool**: ICMP connectivity testing
 - **Traceroute Tool**: Network path analysis  
 - **WHOIS Tool**: RFC 3912 compliant queries (FreeBSD compatible)
+- **ARP Browser**: IPv4 ARP and IPv6 neighbor tables, matching `arp -an` / `ndp -an` (macOS; iOS/iPadOS do not expose the table)
 
 ### 🚧 **In Development**
 - [ ] **DNS Lookup**: Domain name resolution tools
 - [ ] **Port Scanner**: TCP/UDP port connectivity testing
 
 ### 📋 **Planned Features**
-- [ ] **ARP Lookup**: Address Resolution Protocol table inspection
 - [ ] **Wake-on-LAN**: Remote device wake-up functionality
 - [ ] **Nmap Integration**: Network mapping and security scanning
 - [ ] **Network Monitoring**: Continuous connectivity monitoring
