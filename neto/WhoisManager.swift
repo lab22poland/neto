@@ -263,7 +263,7 @@ final class WhoisManager {
     /// Only a failed connect fails the query (whois.c: err "connect()"). Once connected, an error ends the answer
     /// like EOF, even with no data yet: whois.c's fgetln loop stops on a read error and never checks ferror()
     /// (seen live: whois.markmonitor.com resets throttled connections without sending anything).
-    private func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43", canonicalName: String? = nil) async throws -> ServerAnswer {
+    func queryWhoisServerFreeBSD(server: String, query: String, port: String = "43", canonicalName: String? = nil) async throws -> ServerAnswer {
         guard let endpointPort = NWEndpoint.Port(port) else { throw WhoisError.invalidPort(server, port) }
         let formattedQuery = formatQueryForServer(query: query, server: server, canonicalName: canonicalName)
         let connection = NWConnection(host: NWEndpoint.Host(server), port: endpointPort, using: .tcp)
@@ -484,8 +484,9 @@ final class WhoisManager {
     
     /// Keys in order of preference: the first key present wins, and within a key the first line wins
     /// (ARIN `OrgName:` before its `Organization: Name (HANDLE)`, RIPE `org-name:` before the `organisation:` handle)
+    /// (`org-name:` also for APNIC/AFRINIC organisation objects, `owner:` for LACNIC)
     static let registrarKeys = ["registrar:", "registrar name:", "sponsoring registrar:", "orgname:", "org-name:",
-                                "organization:", "organisation:", "maintainer:"]
+                                "owner:", "organization:", "organisation:", "maintainer:"]
     /// `Registered on:` (Nominet), `RegDate:` (ARIN), `created:` (RIPE, NASK, IANA)
     static let creationKeys = ["creation date:", "created:", "registered on:", "registered:", "registration date:",
                                "domain registration date:", "register date:", "regdate:"]
@@ -563,7 +564,8 @@ final class WhoisManager {
     
     /// Decides what the summary may show, from the LAST server's answer only. IANA's answer describes the TLD or
     /// address block (registry operator, TLD creation date, TLD name servers), so it yields fields only when its
-    /// `domain:` is the query itself (e.g. "uk"). Not found or an empty answer shows no fields; an incomplete chain says so.
+    /// `domain:` is the query itself (e.g. "uk"). Not found and an empty answer (no data) show no fields;
+    /// an incomplete chain says so.
     func summarize(lastAnswer: String, server: String, query: String, incompleteReason: String?) -> (
         outcome: WhoisResult.Outcome, status: String, fields: WhoisFields
     ) {
@@ -578,12 +580,14 @@ final class WhoisManager {
         }
         if lastAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // No record (RIPE's "no entries found" is a stripped comment) or a throttling server: it cannot be told apart
-            return (.notFound, "No data: \(server) returned an empty answer for \(query)", none)
+            return (.noData, "No data: \(server) returned an empty answer – no record, or the server is limiting queries", none)
         }
         if onlyIANABlock {
             return (.ianaOnly, "No registry record: IANA refers to no other WHOIS server; its answer describes the TLD or address block, not \(query)", none)
         }
-        return (.found, "WHOIS lookup successful", fields)
+        let hasFields = fields.registrar != nil || fields.registrationDate != nil || fields.expirationDate != nil
+            || !fields.nameServers.isEmpty
+        return (.found, hasFields ? "WHOIS lookup successful" : "No summary fields recognized; see the raw response", fields)
     }
     
     /// Whether IANA's answer is the record of the query itself (a TLD such as "uk"), not of the TLD above it

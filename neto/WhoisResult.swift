@@ -14,8 +14,10 @@ struct WhoisResult: Identifiable {
     enum Outcome: Equatable {
         /// The last server answered with a record (summary fields come from that answer)
         case found
-        /// The last server said it has no such object, or returned no data
+        /// The last server said it has no such object (an explicit "no match" line)
         case notFound
+        /// The last server returned an empty answer: no record, or the server is limiting queries
+        case noData
         /// A referral server did not answer or an answer was cut off; the raw response is partial
         case incomplete
         /// The chain ended at IANA, whose record describes the TLD or address block, not the query
@@ -57,6 +59,11 @@ struct WhoisResult: Identifiable {
     
     /// Response time in milliseconds; nil when it was not measured (e.g. the lookup was stopped)
     let responseTime: Double?
+    
+    /// Whether any summary field was recognized in the last server's answer
+    var hasSummaryFields: Bool {
+        registrar != nil || registrationDate != nil || expirationDate != nil || !nameServers.isEmpty
+    }
     
     init(
         id: UUID = UUID(),

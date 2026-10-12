@@ -156,8 +156,8 @@ struct WhoisView: View {
                         .foregroundColor(result.success && result.outcome == .found ? .primary : .secondary)
                 }
                 
-                // Not found, incomplete or IANA-only answers say so; the raw response below is still shown
-                if result.success && result.outcome != .found {
+                // Not found, no data, incomplete, IANA-only or no recognized fields: say so; the raw response is still shown
+                if result.success && (result.outcome != .found || !result.hasSummaryFields) {
                     Text(result.statusMessage)
                         .font(.caption)
                         .fontWeight(.medium)
@@ -165,8 +165,8 @@ struct WhoisView: View {
                         .accessibilityIdentifier("whois.status")
                 }
                 
-                // Quick info section: fields from the last server's answer only (none when not found)
-                if result.success && result.outcome != .notFound {
+                // Quick info section: fields from the last server's answer only (none when not found or empty)
+                if result.success && result.hasSummaryFields {
                     VStack(alignment: .leading, spacing: 4) {
                         if let registrar = result.registrar {
                             HStack {
@@ -243,6 +243,7 @@ struct WhoisView: View {
         switch result.outcome {
         case .found: return "checkmark.circle.fill"
         case .notFound: return "questionmark.circle.fill"
+        case .noData: return "minus.circle.fill"
         case .incomplete: return "exclamationmark.triangle.fill"
         case .ianaOnly: return "info.circle.fill"
         }

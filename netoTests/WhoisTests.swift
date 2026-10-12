@@ -295,8 +295,9 @@ struct WhoisSummaryTests {
     @Test func emptyAnswerShowsNoData() {
         // RIPE "%ERROR:101: no entries found" is a comment that whois.c strips, leaving nothing
         let summary = manager.summarize(lastAnswer: "", server: "whois.ripe.net", query: "XY1-RIPE", incompleteReason: nil)
-        #expect(summary.outcome == .notFound)
+        #expect(summary.outcome == .noData)   // not "not found": a throttling server answers the same way
         #expect(summary.status.hasPrefix("No data"))
+        #expect(summary.fields.registrar == nil && summary.fields.nameServers.isEmpty)
     }
 
     @Test func markMonitorDatesComeFromTheRegistrar() {
@@ -398,10 +399,166 @@ struct WhoisSummaryTests {
         #expect(fields.nameServers == ["ddns0.bbc.co.uk", "ddns0.bbc.com", "dns1.bbc.co.uk"])
     }
 
+    @Test func lacnicOwner() {
+        let lacnic = """
+        % LACNIC resource: whois.lacnic.net
+
+        inetnum:     200.1.0.0/22
+        status:      allocated
+        owner:       Corporacion Andina de Fomento.
+        ownerid:     VE-CAFO-LACNIC
+        owner-c:     JL10-ARIN
+        created:     19930513
+        changed:     19930513
+
+        nic-hdl:     JL10-ARIN
+        person:      Javier Lopez
+        created:     20030221
+        """
+        let fields = manager.parseWhoisResponse(lacnic, for: "200.1.1.1")
+        #expect(fields.registrar == "Corporacion Andina de Fomento.")
+        #expect(fields.registrationDate == "19930513")
+    }
+
+    @Test func afrinicOrgNameBeforeTheOrganisationHandle() {
+        let afrinic = """
+        inetnum:        196.216.2.0 - 196.216.3.255
+        netname:        AFRINIC
+        descr:          AfriNIC - Internal Use
+        org:            ORG-AFNC1-AFRINIC
+        source:         AFRINIC # Filtered
+
+        organisation:   ORG-AFNC1-AFRINIC
+        org-name:       African Network Information Center - (AfriNIC) Ltd
+        org-type:       RIR
+        """
+        #expect(manager.parseWhoisResponse(afrinic, for: "196.216.2.1").registrar
+                == "African Network Information Center - (AfriNIC) Ltd")
+    }
+
+    @Test func apnicOrgNameAndNoCreationDate() {
+        let apnic = """
+        inetnum:        1.1.1.0 - 1.1.1.255
+        netname:        APNIC-LABS
+        descr:          APNIC and Cloudflare DNS Resolver project
+        org:            ORG-ARAD1-AP
+        last-modified:  2023-04-26T22:57:58Z
+        source:         APNIC
+
+        organisation:   ORG-ARAD1-AP
+        org-name:       APNIC Research and Development
+        org-type:       LIR
+        """
+        let fields = manager.parseWhoisResponse(apnic, for: "1.1.1.1")
+        #expect(fields.registrar == "APNIC Research and Development")
+        #expect(fields.registrationDate == nil)   // last-modified is not a creation date
+    }
+
+    @Test func afrinicWithoutOrganisationSaysNoFieldsRecognized() {
+        // 41.0.0.1: no organisation object; descr/netname are free text and are not used as the holder
+        let afrinic = """
+        inetnum:        41.0.0.0 - 41.0.255.255
+        netname:        Vodacom_Enterprise_Networks_NSA
+        descr:          The IP Block 41.0.0.0/16 has been assigned to Vodacom Bussiness for ISP bussiness (Shared ENS/NSA)
+        country:        ZA
+        status:         ASSIGNED PA
+        mnt-by:         VODACOM-MNT
+        source:         AFRINIC # Filtered
+        """
+        let summary = manager.summarize(lastAnswer: afrinic, server: "whois.afrinic.net", query: "41.0.0.1", incompleteReason: nil)
+        #expect(summary.outcome == .found)
+        #expect(summary.status == "No summary fields recognized; see the raw response")
+        #expect(summary.fields.registrar == nil)
+    }
+
     @Test func emptyValueIsNilNotEmptyString() {
         let fields = manager.parseWhoisResponse("Registrar:\nRegistrar IANA ID: 9999\nCreation Date: \n", for: "x.com")
         #expect(fields.registrar == nil)
         #expect(fields.registrationDate == nil)
+    }
+}
+
+/// The query I/O like whois.c: once connected, an error ends the answer (even an empty one) instead of failing the server.
+/// Uses a one-shot TCP server on 127.0.0.1, so no internet is needed.
+struct WhoisConnectionTests {
+
+    /// Accepts one connection, reads the query, optionally answers, then closes cleanly or resets (SO_LINGER 0)
+    private final class OneShotServer: @unchecked Sendable {
+        let port: UInt16
+
+        init(reply: String, reset: Bool) throws {
+            let listener = socket(AF_INET, SOCK_STREAM, 0)
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let bound = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(listener, sa, length) == 0 && listen(listener, 1) == 0 && getsockname(listener, sa, &length) == 0
+                }
+            }
+            guard listener >= 0, bound else { throw POSIXError(.EADDRNOTAVAIL) }
+            port = UInt16(bigEndian: address.sin_port)
+            let bytes = Array(reply.utf8)
+            Thread.detachNewThread {
+                let client = accept(listener, nil, nil)
+                var buffer = [UInt8](repeating: 0, count: 512)
+                _ = recv(client, &buffer, buffer.count, 0)
+                if !bytes.isEmpty {
+                    _ = bytes.withUnsafeBytes { send(client, $0.baseAddress, $0.count, 0) }
+                    usleep(300_000)   // let the client read the data before the reset
+                }
+                if reset {
+                    var option = linger(l_onoff: 1, l_linger: 0)
+                    setsockopt(client, SOL_SOCKET, SO_LINGER, &option, socklen_t(MemoryLayout<linger>.size))
+                }
+                close(client)
+                close(listener)
+            }
+        }
+    }
+
+    private func ask(_ server: OneShotServer) async throws -> ServerAnswer {
+        try await WhoisManager().queryWhoisServerFreeBSD(server: "127.0.0.1", query: "example.com", port: String(server.port))
+    }
+
+    @Test func resetWithoutDataIsAnEmptyIncompleteAnswer() async throws {
+        let answer = try await ask(OneShotServer(reply: "", reset: true))
+        #expect(answer.bytes.isEmpty)
+        #expect(answer.cutOff?.hasPrefix("closed the connection without an answer") == true)
+    }
+
+    @Test func resetAfterDataKeepsTheData() async throws {
+        let answer = try await ask(OneShotServer(reply: "Domain Name: example.com\n", reset: true))
+        #expect(WhoisManager.decode(answer.bytes) == "Domain Name: example.com\n")
+        #expect(answer.cutOff?.hasPrefix("answer cut off by a connection error") == true)
+    }
+
+    @Test func cleanCloseIsACompleteAnswer() async throws {
+        let empty = try await ask(OneShotServer(reply: "", reset: false))
+        #expect(empty.bytes.isEmpty && empty.cutOff == nil)
+        let full = try await ask(OneShotServer(reply: "Domain Name: example.com\n", reset: false))
+        #expect(WhoisManager.decode(full.bytes) == "Domain Name: example.com\n" && full.cutOff == nil)
+    }
+
+    @Test func refusedConnectionFailsTheServer() async throws {
+        // A bound but not listening port refuses connections: connect() fails, like whois.c's err "connect()"
+        let unused = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(unused) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(unused, $0, length) == 0 && getsockname(unused, $0, &length) == 0 }
+        }
+        try #require(bound)
+        let port = String(UInt16(bigEndian: address.sin_port))
+        await #expect(throws: (any Error).self) {
+            _ = try await WhoisManager().queryWhoisServerFreeBSD(server: "127.0.0.1", query: "example.com", port: port)
+        }
     }
 }
 
