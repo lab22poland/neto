@@ -22,8 +22,14 @@ struct ArpEntry: Identifiable, Hashable {
     /// Network interface name (en0, en4, lo0, etc.)
     let interface: String
     
-    /// Status of the ARP entry (permanent, incomplete, or ttl value)
+    /// Status of the entry: "permanent", "expired" or "expires in …"
     let status: String
+    
+    /// Link type as printed by `arp` ("ethernet", "bridge", …)
+    var linkType: String = "ethernet"
+    
+    /// Whether the entry is bound to its interface (RTF_IFSCOPE, shown as "ifscope")
+    var isScoped: Bool = true
     
     /// Indicates if the entry is permanent
     var isPermanent: Bool {
@@ -37,8 +43,20 @@ struct ArpEntry: Identifiable, Hashable {
     
     /// Formats the entry to match 'arp -an' command output
     var commandLineFormat: String {
-        let statusPart = isPermanent ? "ifscope permanent" : "ifscope"
-        return "? (\(ipAddress)) at \(macAddress) on \(interface) \(statusPart) [ethernet]"
+        let flags = [isScoped ? "ifscope" : nil, isPermanent ? "permanent" : nil].compactMap { $0 }
+        return (["? (\(ipAddress)) at \(macAddress) on \(interface)"] + flags + ["[\(linkType)]"]).joined(separator: " ")
+    }
+    
+    /// Orders addresses numerically: IPv4 before IPv6, then byte by byte
+    var addressSortKey: [UInt8] {
+        var v4 = in_addr(), v6 = in6_addr()
+        if inet_pton(AF_INET, ipAddress, &v4) == 1 {
+            return [4] + withUnsafeBytes(of: &v4) { Array($0) }
+        }
+        if inet_pton(AF_INET6, ipAddress, &v6) == 1 {
+            return [6] + withUnsafeBytes(of: &v6) { Array($0) }
+        }
+        return [255] + Array(ipAddress.utf8)
     }
 }
 
@@ -67,7 +85,7 @@ struct ArpResult {
     /// Returns all entries formatted as command-line output (like 'arp -an')
     var commandLineOutput: String {
         return allEntries
-            .sorted { ($0.ipAddress, $0.interface) < ($1.ipAddress, $1.interface) }
+            .sorted { $0.addressSortKey.lexicographicallyPrecedes($1.addressSortKey) || ($0.addressSortKey == $1.addressSortKey && $0.interface < $1.interface) }
             .map { $0.commandLineFormat }
             .joined(separator: "\n")
     }
@@ -76,7 +94,7 @@ struct ArpResult {
     func commandLineOutput(for interface: String) -> String {
         let entries = interface == "All" ? allEntries : (entriesByInterface[interface] ?? [])
         return entries
-            .sorted { $0.ipAddress < $1.ipAddress }
+            .sorted { $0.addressSortKey.lexicographicallyPrecedes($1.addressSortKey) }
             .map { $0.commandLineFormat }
             .joined(separator: "\n")
     }
