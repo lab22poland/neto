@@ -88,6 +88,23 @@ struct WhoisManagerLogicTests {
         #expect(text(processed) == "a\r\nLast update of WHOIS database: X\r\n\n")
     }
 
+    @Test func lastLineWithoutNewlineAndEmptyInput() {
+        #expect(text(WhoisManager().processResponse("a\nWhois Server: whois.example.net", server: "x")) == "a\nWhois Server: whois.example.net")
+        #expect(WhoisManager().processResponse("a\nWhois Server: whois.example.net", server: "x").referral?.host == "whois.example.net")
+        let empty = WhoisManager().processResponse("", server: "x")
+        #expect(empty.output.isEmpty && empty.referral == nil)
+    }
+
+    @Test func arinCommentModeWithCRLF() {
+        let processed = WhoisManager().processResponse("#\r\n# terms\r\n\r\nNetRange: 1\r\n\r\n# footer\r\n", server: "whois.arin.net")
+        #expect(text(processed) == "NetRange: 1\r\n\r\n")
+    }
+
+    @Test func answersAreDecodedPerServer() {
+        #expect(WhoisManager.decode(Array("Zürich".utf8)) == "Zürich")
+        #expect(WhoisManager.decode([0x5A, 0xFC, 0x72]) == "Zür", "invalid UTF-8 falls back to Latin-1")
+    }
+
     @Test func ianaReferralIsFound() {
         let processed = WhoisManager().processResponse(Self.ianaCom, server: "whois.iana.org")
         #expect(processed.referral?.host == "whois.verisign-grs.com")

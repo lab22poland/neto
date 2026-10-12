@@ -104,6 +104,8 @@ final class WhoisManager {
             }
             
             let result = try await performFreeBSDWhoisLookup(query: cleanQuery, startTime: startTime)
+            // A result that completes after Stop must not reach a newer lookup
+            if Task.isCancelled { return }
             
             await MainActor.run {
                 onResult(result)
@@ -143,23 +145,25 @@ final class WhoisManager {
         var output = ""
         var lastServerOutput = ""
         var status = "WHOIS lookup successful"
+        var answeredServer = server
         
         for hop in 0...Self.maxReferrals {
             if Task.isCancelled { throw CancellationError() }
             let response: [UInt8]
             do {
                 // whois.c gethostinfo(): an unresolvable host ends the lookup right away
-                guard let canonicalName = await Self.canonicalName(of: server) else {
+                guard let canonicalName = await Self.resolveCanonicalName(of: server) else {
                     throw WhoisError.hostNotFound(server)
                 }
                 response = try await queryWhoisServerFreeBSD(server: server, query: query, port: port, canonicalName: canonicalName)
             } catch {
                 // The first server failing fails the lookup; a later one keeps what was printed so far, like whois.c's err()
-                if hop == 0 || error is CancellationError { throw error }
+                if hop == 0 || Task.isCancelled || error is CancellationError { throw error }
                 output += "whois: \(server): \(error.localizedDescription)\n"
                 status = "WHOIS lookup incomplete: \(server) failed"
                 break
             }
+            answeredServer = server
             let processed = processResponse(response, server: server)
             let text = Self.decode(processed.output)
             output += text
@@ -188,7 +192,7 @@ final class WhoisManager {
             registrationDate: last.registrationDate ?? all.registrationDate,
             expirationDate: last.expirationDate ?? all.expirationDate,
             nameServers: last.nameServers.isEmpty ? all.nameServers : last.nameServers,
-            whoisServer: server,
+            whoisServer: answeredServer,   // the last server that answered (a failed referral is reported in the raw response)
             statusMessage: status,
             responseTime: responseTime
         )
@@ -215,8 +219,9 @@ final class WhoisManager {
         return next
     }
     
-    /// Canonical name of a host (whois.c compares it with the Verisign host); nil if it cannot be resolved
-    static func canonicalName(of host: String) async -> String? {
+    /// Resolves a host like whois.c's gethostinfo(): `nil` if it cannot be resolved, otherwise its canonical name
+    /// (compared with the Verisign host; `.some(nil)` for numeric hosts, which have none)
+    static func resolveCanonicalName(of host: String) async -> String?? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 var hints = addrinfo()
@@ -225,11 +230,11 @@ final class WhoisManager {
                 hints.ai_socktype = SOCK_STREAM
                 var list: UnsafeMutablePointer<addrinfo>?
                 guard getaddrinfo(host, "43", &hints, &list) == 0, let list else {
-                    continuation.resume(returning: nil)
+                    continuation.resume(returning: .none)
                     return
                 }
                 defer { freeaddrinfo(list) }
-                continuation.resume(returning: list.pointee.ai_canonname.map { String(cString: $0) })
+                continuation.resume(returning: .some(list.pointee.ai_canonname.map { String(cString: $0) }))
             }
         }
     }
@@ -257,6 +262,7 @@ final class WhoisManager {
         let formattedQuery = formatQueryForServer(query: query, server: server, canonicalName: canonicalName)
         let connection = NWConnection(host: NWEndpoint.Host(server), port: endpointPort, using: .tcp)
         let completion = CompletionOnce<[UInt8]>()
+        let buffer = ResponseBuffer()
         
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -269,7 +275,7 @@ final class WhoisManager {
                             if let error {
                                 completion.finish(.failure(error))
                             } else {
-                                Self.readAll(connection: connection, completion: completion)
+                                Self.readAll(connection: connection, into: buffer, completion: completion)
                             }
                         })
                     case .waiting(let error), .failed(let error):
@@ -283,7 +289,9 @@ final class WhoisManager {
                 }
                 connection.start(queue: .global())
                 DispatchQueue.global().asyncAfter(deadline: .now() + connectionTimeout) {
-                    completion.finish(.failure(URLError(.timedOut)))
+                    // Like a read error: what arrived so far is the answer
+                    let received = buffer.bytes
+                    completion.finish(received.isEmpty ? .failure(URLError(.timedOut)) : .success(received))
                 }
             }
         } onCancel: {
@@ -292,16 +300,16 @@ final class WhoisManager {
     }
     
     /// Reads until the server closes the connection; an error after data counts as the end of the answer
-    private static func readAll(connection: NWConnection, completion: CompletionOnce<[UInt8]>, received: [UInt8] = []) {
+    private static func readAll(connection: NWConnection, into buffer: ResponseBuffer, completion: CompletionOnce<[UInt8]>) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, error in
-            var bytes = received
-            if let data { bytes.append(contentsOf: data) }
+            if let data { buffer.append(data) }
             if let error {
-                completion.finish(bytes.isEmpty ? .failure(error) : .success(bytes))
+                let received = buffer.bytes
+                completion.finish(received.isEmpty ? .failure(error) : .success(received))
             } else if isComplete {
-                completion.finish(.success(bytes))
+                completion.finish(.success(buffer.bytes))
             } else {
-                readAll(connection: connection, completion: completion, received: bytes)
+                readAll(connection: connection, into: buffer, completion: completion)
             }
         }
     }
@@ -384,7 +392,7 @@ final class WhoisManager {
             if line == Array("-- \r\n".utf8) { break }                                   // Nominet
             if comment == 1 && line.first == UInt8(ascii: "#") { break }                 // RIRs
             if comment == 2 {
-                if let first = line.first, [UInt8(ascii: "#"), UInt8(ascii: "%"), 0x0D, 0x0A].contains(first) { continue }
+                if let first = line.first, [UInt8(ascii: "#"), UInt8(ascii: "%"), 0x0D, 0x0A, 0x00].contains(first) { continue }
                 comment = 1
             }
             output += line
@@ -563,6 +571,24 @@ enum WhoisError: LocalizedError {
         case .hostNotFound(let host): return "\(host): host not found"
         case .invalidPort(let host, let port): return "\(host): invalid port \(port)"
         }
+    }
+}
+
+/// Bytes received so far, shared between the read callbacks and the timeout
+private final class ResponseBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [UInt8] = []
+
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(contentsOf: data)
+        lock.unlock()
+    }
+
+    var bytes: [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }
 
