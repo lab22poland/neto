@@ -57,7 +57,7 @@ final class netoUITests: XCTestCase {
 
         start.tap()
         XCTAssertTrue(element("ping.stop").waitForExistence(timeout: 2), "Stop must appear while pinging")
-        // Statistics instead of result rows: the rows are layout-dependent (hidden in a small macOS window)
+        // Statistics prove all replies arrived; the row check below proves the results list is visible
         XCTAssertTrue(wait(for: element("ping.stats"), text: "Packets: 5 sent, 5 received", timeout: 15),
                       "All 5 echo requests to 127.0.0.1 must be answered")
         XCTAssertTrue(waitForDisappearance(of: element("ping.stop"), timeout: 5), "Stop must disappear after the run")
@@ -160,7 +160,7 @@ final class netoUITests: XCTestCase {
     }
 
     /// Static text is exposed as `label` on iOS and as `value` on macOS
-    /// Static text is exposed as `label` on iOS and as `value` on macOS
+    /// First static text starting with the prefix (iOS exposes text as `label`, macOS as `value`)
     private func text(beginningWith prefix: String) -> XCUIElement {
         app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ OR value BEGINSWITH %@", prefix, prefix)).firstMatch
     }

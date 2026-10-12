@@ -15,16 +15,18 @@ struct PingView: View {
     @State private var showConfiguration = false
     
     var body: some View {
-        VStack(spacing: 20) {
-            headerSection
-            inputSection
-            configurationSection
-            errorSection
-            resultsSection
-            statisticsSection
-            Spacer()
+        // The whole tool scrolls, so the results list keeps its minimum height on small screens and windows
+        ScrollView {
+            VStack(spacing: 20) {
+                headerSection
+                inputSection
+                configurationSection
+                errorSection
+                resultsSection
+                statisticsSection
+            }
+            .padding()
         }
-        .padding()
         .navigationTitle("Ping")
         .onKeyPress(.escape) {
             if viewModel.isPinging {
@@ -196,7 +198,7 @@ struct PingView: View {
                         }
                     }
                 }
-                // A minimum height keeps rows visible when the window is small (the VStack would squeeze the ScrollView to 0)
+                // Without a minimum the layout squeezes the list to zero height when space is short
                 .frame(minHeight: 120, maxHeight: 200)
             }
         }
