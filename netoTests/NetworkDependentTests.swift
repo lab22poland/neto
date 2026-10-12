@@ -65,6 +65,42 @@ struct LiveNetworkTests {
         #expect(!host.ipAddress.isEmpty)
     }
 
+    private func dns(_ name: String, _ type: DNSRecordType, _ server: DNSServer = .cloudflare,
+                     _ transport: DNSTransport = .udp, ednsUDPSize: UInt16 = 1232) async -> DnsResult {
+        await withCheckedContinuation { continuation in
+            _ = DnsManager().performLookup(name: name, type: type, server: server, transport: transport,
+                                           ednsUDPSize: ednsUDPSize) { continuation.resume(returning: $0) }
+        }
+    }
+
+    @Test(arguments: DNSTransport.allCases)
+    func dnsReverseLookupOverEveryTransport(_ transport: DNSTransport) async {
+        let result = await dns("8.8.8.8.in-addr.arpa.", .ptr, .cloudflare, transport)
+        #expect(result.error == nil, "\(result.error ?? "")")
+        #expect(result.message?.answers.map(\.data) == ["dns.google."])
+        #expect(result.transport == transport)
+    }
+
+    @Test func dnsNxdomainCarriesSOA() async {
+        let result = await dns("nonexistent-neto-test-12345.com", .a)
+        #expect(result.message?.rcodeName == "NXDOMAIN")
+        #expect(result.message?.authority.first?.typeName == "SOA")
+    }
+
+    @Test func dnsTruncatedUDPIsRetriedOverTCP() async {
+        // google.com TXT is ~1.2 kB: with a 512-byte EDNS size the UDP answer is truncated (TC=1)
+        let result = await dns("google.com", .txt, ednsUDPSize: 512)
+        #expect(result.transport == .tcp)
+        #expect((result.message?.answers.count ?? 0) > 5)
+    }
+
+    @Test func dnsSystemServer() async throws {
+        let address = try #require(DnsManager.systemServers().first, "no system DNS server found")
+        let result = await dns("example.com", .a, DNSServer(label: "System", address: address, tlsHost: nil, dohURL: nil))
+        #expect(result.error == nil, "\(result.error ?? "")")
+        #expect(result.message?.rcodeName == "NOERROR")
+    }
+
     @Test @MainActor func pingPublicResolver() async {
         let manager = PingManager()
         var results: [PingResult] = []
