@@ -266,7 +266,7 @@ final class WhoisManager {
             // AS number handling
             if cleanQuery.lowercased().hasPrefix("as") {
                 let asNumber = String(cleanQuery.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                if asNumber.allSatisfy({ $0.isNumber }) {
+                if !asNumber.isEmpty && asNumber.allSatisfy({ $0.isASCII && $0.isNumber }) {
                     return "+ a \(asNumber)\r\n"
                 }
             }

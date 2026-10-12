@@ -101,10 +101,10 @@ final class WhoisViewModel: ObservableObject {
     private func isValidWhoisQuery(_ input: String) -> Bool {
         let cleanInput = input.lowercased()
         
-        // Check for AS number (ASxxxxx or AS xxxxx format)
+        // Check for AS number (ASxxxxx or AS xxxxx format): only the prefix is removed, and digits are required
         if cleanInput.hasPrefix("as") {
-            let asNumber = cleanInput.replacingOccurrences(of: "as", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if asNumber.allSatisfy({ $0.isNumber }) {
+            let asNumber = cleanInput.dropFirst(2).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !asNumber.isEmpty && asNumber.allSatisfy({ $0.isASCII && $0.isNumber }) {
                 return true
             }
         }
