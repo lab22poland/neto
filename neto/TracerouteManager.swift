@@ -35,11 +35,21 @@ final class TracerouteManager {
     private var family: Int32 = AF_INET
     private var identifier: UInt16 = 0
     private var nextSequenceNumber: UInt16 = 0
-    private var sendTimes: [UInt16: Date] = [:]
+    /// Send time per sequence number on the monotonic clock (DispatchTime nanoseconds)
+    private var sendTimes: [UInt16: UInt64] = [:]
     private var replies: [UInt16: (time: Double, address: String, reply: ICMPPacket.ProbeReply)] = [:]
     private var runTask: Task<Void, Never>?
+    /// Incremented per socket, so replies read from a closed socket cannot reach a newer run
+    private var socketGeneration = 0
+    /// Serial queue that reads the socket
+    private let readQueue = DispatchQueue(label: "pl.lab22.neto.traceroute.read", qos: .userInitiated)
     /// Set when receiving fails hard (e.g. EPERM in the sandbox); ends the run
     private var socketError: Error?
+
+    deinit {
+        // Close the socket if the manager goes away during a run
+        readSource?.cancel()
+    }
 
     // MARK: - Public Methods
 
@@ -224,6 +234,7 @@ final class TracerouteManager {
                 if case .destinationUnreachable(_, let code) = reply.reply { return code } else { return nil }
             }.first
             let probeTimes: [Double?] = sequenceNumbers.map { replies[$0]?.time }
+            let probeAddresses: [String?] = sequenceNumbers.map { replies[$0]?.address }
             let times = probeTimes.compactMap { $0 }
             let result = TracerouteResult(
                 hopNumber: hop,
@@ -234,7 +245,8 @@ final class TracerouteManager {
                                           unreachableCode: unreachableCode, family: family),
                 isDestination: reachedTarget,
                 probeTimes: probeTimes,
-                unreachableCode: unreachableCode
+                unreachableCode: unreachableCode,
+                probeAddresses: probeAddresses
             )
             deliver(result)
             if let routerAddress {
@@ -259,7 +271,7 @@ final class TracerouteManager {
             let sequenceNumber = nextSequenceNumber
             nextSequenceNumber &+= 1
             let packet = ICMPPacket.echoRequest(family: family, identifier: identifier, sequenceNumber: sequenceNumber, payload: Data(repeating: 0x4E, count: 24))
-            sendTimes[sequenceNumber] = Date()
+            sendTimes[sequenceNumber] = DispatchTime.now().uptimeNanoseconds
             _ = packet.withUnsafeBytes { bytes in
                 target.address.withUnsafeBytes { address in
                     sendto(socketFD, bytes.baseAddress, bytes.count, 0,
@@ -298,7 +310,8 @@ final class TracerouteManager {
                                           unreachableCode: result.unreachableCode, family: family),
                 isDestination: result.isDestination,
                 probeTimes: result.probeTimes,
-                unreachableCode: result.unreachableCode
+                unreachableCode: result.unreachableCode,
+                probeAddresses: result.probeAddresses
             ))
         }
     }
@@ -319,9 +332,19 @@ final class TracerouteManager {
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         socketFD = fd
 
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        source.setEventHandler { [weak self] in
-            MainActor.assumeIsolated { self?.readReplies(fd: fd) }
+        // Replies are read and timestamped off the main thread, so main-thread latency does not inflate the RTT;
+        // the results are then recorded on the main actor.
+        let identifier = self.identifier
+        socketGeneration += 1
+        let generation = socketGeneration
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
+        source.setEventHandler { [weak self, weak source] in
+            let (received, error) = Self.readReplies(fd: fd, family: family, identifier: identifier)
+            // Cancel right here on a hard error: the read source is level-triggered and would fire again immediately
+            if error != nil { source?.cancel() }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.record(received, error: error, generation: generation) }
+            }
         }
         source.setCancelHandler { close(fd) }
         readSource = source
@@ -340,8 +363,17 @@ final class TracerouteManager {
         socketFD = -1
     }
 
-    @MainActor
-    private func readReplies(fd: Int32) {
+    /// A probe reply as read from the socket, with its receive time on the monotonic clock
+    private struct ReceivedReply {
+        let reply: ICMPPacket.ProbeReply
+        let address: String
+        let receivedAt: UInt64
+    }
+
+    /// Drains the socket (runs on `readQueue`). Every ICMP socket sees all ICMP traffic of the host,
+    /// so only replies to our identifier are kept. Returns a hard error (e.g. sandbox deny) if receiving fails.
+    private static func readReplies(fd: Int32, family: Int32, identifier: UInt16) -> ([ReceivedReply], Error?) {
+        var received: [ReceivedReply] = []
         var buffer = [UInt8](repeating: 0, count: 2048)
         var from = sockaddr_storage()
         while true {
@@ -351,20 +383,31 @@ final class TracerouteManager {
             }
             if count < 0 {
                 let error = errno
-                if error == EAGAIN || error == EWOULDBLOCK || error == EINTR { return }
-                // Hard error (e.g. sandbox deny): stop reading instead of spinning on the read source
-                socketError = POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
-                closeSocket()
-                return
+                if error == EAGAIN || error == EWOULDBLOCK || error == EINTR { return (received, nil) }
+                return (received, POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO))
             }
-            guard count > 0 else { return }
-            let received = Date()
-            // Every ICMP socket sees all ICMP traffic of the host, so only replies to our identifier count
-            guard let reply = ICMPPacket.probeReply(in: Data(buffer[0..<count]), family: family, identifier: identifier),
-                  let sent = sendTimes[reply.sequenceNumber],
-                  replies[reply.sequenceNumber] == nil else { continue }
-            let address = withUnsafeBytes(of: &from) { Self.numericHost(Data($0.prefix(Int(fromLength)))) } ?? "?"
-            replies[reply.sequenceNumber] = (received.timeIntervalSince(sent) * 1000, address, reply)
+            guard count > 0 else { return (received, nil) }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard let reply = ICMPPacket.probeReply(in: Data(buffer[0..<count]), family: family, identifier: identifier) else { continue }
+            let address = withUnsafeBytes(of: &from) { numericHost(Data($0.prefix(Int(fromLength)))) } ?? "?"
+            received.append(ReceivedReply(reply: reply, address: address, receivedAt: now))
+        }
+    }
+
+    /// Records replies of the current socket; the first reply per sequence number wins
+    @MainActor
+    private func record(_ received: [ReceivedReply], error: Error?, generation: Int) {
+        guard generation == socketGeneration else { return }
+        for item in received {
+            guard let sent = sendTimes[item.reply.sequenceNumber],
+                  replies[item.reply.sequenceNumber] == nil,
+                  item.receivedAt >= sent else { continue }
+            replies[item.reply.sequenceNumber] = (Double(item.receivedAt - sent) / 1_000_000, item.address, item.reply)
+        }
+        if let error, socketError == nil {
+            // Stop reading instead of spinning on the read source; the trace loop reports the error
+            socketError = error
+            closeSocket()
         }
     }
 
