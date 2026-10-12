@@ -37,6 +37,8 @@ struct WhoisManagerLogicTests {
         ("müller.de", "whois.denic.de", "-T dn müller.de\r\n"),
         ("example.dk", "whois.dk-hostmaster.dk", "--show-handles example.dk\r\n"),
         ("AS15169", "whois.arin.net", "+ a 15169\r\n"),
+        ("AS", "whois.arin.net", "+ a \r\n"),         // same as whois.c (empty AS lookup); the UI rejects "AS" anyway
+        ("AS１５", "whois.arin.net", "+ AS１５\r\n"),  // only ASCII digits make an AS lookup, like whois.c strspn("0123456789")
         ("8.8.8.8", "whois.arin.net", "+ 8.8.8.8\r\n"),
         ("google.com", "whois.verisign-grs.com", "domain google.com\r\n"),
         ("example.org", "whois.publicinterestregistry.org", "example.org\r\n"),
@@ -93,7 +95,8 @@ struct WhoisManagerLogicTests {
 struct WhoisQueryValidationTests {
 
     @Test(arguments: ["google.com", "site.co.uk", "sub.example.com", "8.8.8.8", "2001:4860:4860::8888",
-                      "AS15169", "as15169", "AS 15169", "John Smith", "JD123-ARIN", "invalid_domain"])
+                      "AS15169", "as15169", "AS 15169", "John Smith", "JD123-ARIN", "invalid_domain",
+                      "as1as2"])   // not an AS number, but a valid alphanumeric handle
     func validQuery(_ query: String) {
         let viewModel = WhoisViewModel()
         viewModel.targetQuery = query
@@ -107,13 +110,11 @@ struct WhoisQueryValidationTests {
         #expect(!viewModel.isTargetQueryValid)
     }
 
-    @Test(arguments: ["as", "AS", "as1as2"])
+    @Test(arguments: ["as", "AS", "as "])
     func malformedASNumber(_ query: String) {
         let viewModel = WhoisViewModel()
         viewModel.targetQuery = query
-        withKnownIssue("AS validation removes every \"as\" and accepts an empty number") {
-            #expect(!viewModel.isTargetQueryValid)
-        }
+        #expect(!viewModel.isTargetQueryValid, "\"as\" alone is neither an AS number nor a handle (too short)")
     }
 
     @Test func emptyQueryShowsError() {
