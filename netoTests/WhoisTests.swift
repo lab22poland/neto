@@ -55,18 +55,15 @@ struct WhoisManagerLogicTests {
         ("ReferralServer:  whois://whois.ripe.net\n", "whois.ripe.net", "43"),
         ("ReferralServer:  rwhois://rwhois.example.net:4321\n", "rwhois.example.net", "4321"),
         ("refer: whois.verisign-grs.com\n", nil, nil),                          // not a whois.c referral prefix
-        ("Registrar WHOIS Server: http://whois.cscglobal.com\n", "http", nil),  // whois.c: host "http", port "//…" is invalid
+        ("Registrar WHOIS Server: http://whois.cscglobal.com\n", nil, nil),     // whois.c: host "http" + ":" without digits = invalid port
+        ("Whois Server: \n", nil, nil),                                          // matching prefix, empty host: no referral
         ("ReferralServer:  rwhois://rwhois.example.net:123456\n", nil, nil),    // ports of 6+ digits: no recursion
     ] as [(String, String?, String?)])
     func referralInLine(line: String, host: String?, port: String?) {
         let referral = WhoisManager.referral(in: line, prefixes: ["whois:", "Whois Server:", "Registrar WHOIS Server:",
                                                                   "ReferralServer:  whois://", "ReferralServer:  rwhois://"])
-        if host == "http" {
-            #expect(referral == nil, "a host followed by ':' and no digits is an invalid port")
-        } else {
-            #expect(referral?.host == host)
-            #expect(referral?.port == port)
-        }
+        #expect(referral?.host == host)
+        #expect(referral?.port == port)
     }
 
     /// Raw answers captured with nc from the real servers on 2026-10-12
@@ -74,29 +71,46 @@ struct WhoisManagerLogicTests {
     private static let verisignGoogle = "   Domain Name: GOOGLE.COM\r\n   Registry Domain ID: 2138514_DOMAIN_COM-VRSN\r\n   Registrar WHOIS Server: whois.markmonitor.com\r\n   Registrar URL: http://www.markmonitor.com\r\n   Updated Date: 2019-09-09T15:39:04Z\r\n   Creation Date: 1997-09-15T04:00:00Z\r\n   Registry Expiry Date: 2028-09-14T04:00:00Z\r\n   Registrar: MarkMonitor Inc.\r\n   Registrar IANA ID: 292\r\n   Registrar Abuse Contact Email: abusecomplaints@markmonitor.com\r\n   Registrar Abuse Contact Phone: +1.2086851750\r\n   Domain Status: clientDeleteProhibited https://icann.org/epp#clientDeleteProhibited\r\n   Domain Status: clientTransferProhibited https://icann.org/epp#clientTransferProhibited\r\n   Domain Status: clientUpdateProhibited https://icann.org/epp#clientUpdateProhibited\r\n   Domain Status: serverDeleteProhibited https://icann.org/epp#serverDeleteProhibited\r\n   Domain Status: serverTransferProhibited https://icann.org/epp#serverTransferProhibited\r\n   Domain Status: serverUpdateProhibited https://icann.org/epp#serverUpdateProhibited\r\n   Name Server: NS1.GOOGLE.COM\r\n   Name Server: NS2.GOOGLE.COM\r\n   Name Server: NS3.GOOGLE.COM\r\n   Name Server: NS4.GOOGLE.COM\r\n   DNSSEC: unsigned\r\n   URL of the ICANN Whois Inaccuracy Complaint Form: https://www.icann.org/wicf/\r\n>>> Last update of whois database: 2026-10-12T08:21:09Z <<<\r\n\r\nFor more information on Whois status codes, please visit https://icann.org/epp\r\n\r\nNOTICE: The expiration date displayed in this record is the date the\r\nregistrar's sponsorship of the domain name registration in the registry is\r\ncurrently set to expire. This date does not necessarily reflect the expiration\r\ndate of the domain name registrant's agreement with the sponsoring\r\nregistrar.  Users may consult the sponsoring registrar's Whois database to\r\nview the registrar's reported date of expiration for this registration.\r\n\r\nTERMS OF USE: You are not authorized to access or query our Whois\r\ndatabase through the use of electronic processes that are high-volume and\r\nautomated except as reasonably necessary to register domain names or\r\nmodify existing registrations; the Data in VeriSign Global Registry\r\nServices' (\"VeriSign\") Whois database is provided by VeriSign for\r\ninformation purposes only, and to assist persons in obtaining information\r\nabout or related to a domain name registration record. VeriSign does not\r\nguarantee its accuracy. By submitting a Whois query, you agree to abide\r\nby the following terms of use: You agree that you may use this Data only\r\nfor lawful purposes and that under no circumstances will you use this Data\r\nto: (1) allow, enable, or otherwise support the transmission of mass\r\nunsolicited, commercial advertising or solicitations via e-mail, telephone,\r\nor facsimile; or (2) enable high volume, automated, electronic processes\r\nthat apply to VeriSign (or its computer systems). The compilation,\r\nrepackaging, dissemination or other use of this Data is expressly\r\nprohibited without the prior written consent of VeriSign. You agree not to\r\nuse electronic processes that are automated and high-volume to access or\r\nquery the Whois database except as reasonably necessary to register\r\ndomain names or modify existing registrations. VeriSign reserves the right\r\nto restrict your access to the Whois database in its sole discretion to ensure\r\noperational stability.  VeriSign may restrict or terminate your access to the\r\nWhois database for failure to abide by these terms of use. VeriSign\r\nreserves the right to modify these terms at any time.\r\n\r\nThe Registry database contains ONLY .COM, .NET, .EDU domains and\r\nRegistrars.\r\n"
     private static let arin8888 = "\n#\n# ARIN WHOIS data and services are subject to the Terms of Use\n# available at: https://www.arin.net/resources/registry/whois/tou/\n#\n# If you see inaccuracies in the results, please report at\n# https://www.arin.net/resources/registry/whois/inaccuracy_reporting/\n#\n# Copyright 1997-2026, American Registry for Internet Numbers, Ltd.\n#\n\n\n#\n# Query terms are ambiguous.  The query is assumed to be:\n#     \"n + 8.8.8.8\"\n#\n# Use \"?\" to get help.\n#\n\nNetRange:       8.8.8.0 - 8.8.8.255\nCIDR:           8.8.8.0/24\nNetName:        GOGL\nNetHandle:      NET-8-8-8-0-2\nParent:         NET8 (NET-8-0-0-0-0)\nNetType:        Direct Allocation\nOriginAS:       \nOrganization:   Google LLC (GOGL)\nRegDate:        2023-12-28\nUpdated:        2023-12-28\nRef:            https://rdap.arin.net/registry/ip/8.8.8.0\n\n\n\nOrgName:        Google LLC\nOrgId:          GOGL\nAddress:        1600 Amphitheatre Parkway\nCity:           Mountain View\nStateProv:      CA\nPostalCode:     94043\nCountry:        US\nRegDate:        2000-03-30\nUpdated:        2019-10-31\nComment:        Please note that the recommended way to file abuse complaints are located in the following links. \nComment:        \nComment:        To report abuse and illegal activity: https://www.google.com/contact/\nComment:        \nComment:        For legal requests: http://support.google.com/legal \nComment:        \nComment:        Regards, \nComment:        The Google Team\nRef:            https://rdap.arin.net/registry/entity/GOGL\n\n\nOrgTechHandle: ZG39-ARIN\nOrgTechName:   Google LLC\nOrgTechPhone:  +1-650-253-0000 \nOrgTechEmail:  arin-contact@google.com\nOrgTechRef:    https://rdap.arin.net/registry/entity/ZG39-ARIN\n\nOrgAbuseHandle: ABUSE5250-ARIN\nOrgAbuseName:   Abuse\nOrgAbusePhone:  +1-650-253-0000 \nOrgAbuseEmail:  network-abuse@google.com\nOrgAbuseRef:    https://rdap.arin.net/registry/entity/ABUSE5250-ARIN\n\n\n#\n# ARIN WHOIS data and services are subject to the Terms of Use\n# available at: https://www.arin.net/resources/registry/whois/tou/\n#\n# If you see inaccuracies in the results, please report at\n# https://www.arin.net/resources/registry/whois/inaccuracy_reporting/\n#\n# Copyright 1997-2026, American Registry for Internet Numbers, Ltd.\n#\n\n"
 
+    private func text(_ processed: WhoisManager.ProcessedResponse) -> String {
+        String(decoding: processed.output, as: UTF8.self)
+    }
+
+    @Test func crlfAnswerWithoutReferralEndsTheChain() {
+        // whois.dns.pl ends with CRLF lines; an empty last line must not look like an actually_arin line
+        let processed = WhoisManager().processResponse("DOMAIN NAME: nask.pl\r\n\r\n", server: "whois.dns.pl")
+        #expect(processed.referral == nil)
+        #expect(text(processed) == "DOMAIN NAME: nask.pl\r\n\r\n")
+    }
+
+    @Test func linesAreComparedAsBytes() {
+        // "Last update of WHOIS database:" variant without ">>> " and with CRLF: whois.c's byte length check passes
+        let processed = WhoisManager().processResponse("a\r\nLast update of WHOIS database: X\r\nlegal\r\n", server: "whois.example")
+        #expect(text(processed) == "a\r\nLast update of WHOIS database: X\r\n\n")
+    }
+
     @Test func ianaReferralIsFound() {
         let processed = WhoisManager().processResponse(Self.ianaCom, server: "whois.iana.org")
         #expect(processed.referral?.host == "whois.verisign-grs.com")
-        #expect(processed.output == Self.ianaCom, "IANA output is printed unchanged")
+        #expect(text(processed) == Self.ianaCom, "IANA output is printed unchanged")
     }
 
     @Test func verisignLegalTextIsCut() {
         let processed = WhoisManager().processResponse(Self.verisignGoogle, server: "whois.verisign-grs.com")
         #expect(processed.referral?.host == "whois.markmonitor.com")
-        #expect(processed.output.hasSuffix("<<<\r\n\n"), "whois.c prints the 'Last update' line, a newline, and stops")
-        #expect(!processed.output.contains("TERMS OF USE"))
+        #expect(text(processed).hasSuffix("<<<\r\n\n"), "whois.c prints the 'Last update' line, a newline, and stops")
+        #expect(!text(processed).contains("TERMS OF USE"))
     }
 
     @Test func arinCommentsAreStripped() {
         let processed = WhoisManager().processResponse(Self.arin8888, server: "whois.arin.net")
-        #expect(processed.output.hasPrefix("NetRange:"), "leading comment block is skipped")
-        #expect(!processed.output.contains("# ARIN WHOIS data"), "trailing comment block ends the output")
-        #expect(processed.output.contains("OrgName:        Google LLC"))
+        #expect(text(processed).hasPrefix("NetRange:"), "leading comment block is skipped")
+        #expect(!text(processed).contains("# ARIN WHOIS data"), "trailing comment block ends the output")
+        #expect(text(processed).contains("OrgName:        Google LLC"))
     }
 
     @Test func nominetStopsAtSeparator() {
         let processed = WhoisManager().processResponse("Domain name:\r\n    bbc.co.uk\r\n-- \r\nWHOIS lookup made at 10:00\r\n", server: "whois.nic.uk")
-        #expect(processed.output == "Domain name:\r\n    bbc.co.uk\r\n")
+        #expect(text(processed) == "Domain name:\r\n    bbc.co.uk\r\n")
     }
 
     @Test func actuallyArinRedirectsToArin() {
