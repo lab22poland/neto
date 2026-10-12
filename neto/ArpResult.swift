@@ -22,7 +22,9 @@ struct ArpEntry: Identifiable, Hashable {
     /// Network interface name (en0, en4, lo0, etc.)
     let interface: String
     
-    /// Status of the entry: "permanent", "expired", "expires in …" or "unknown"; IPv6 entries are prefixed with the ND state ("stale, …")
+    /// Status of the entry: "permanent", "route expires in …" / "route expired" (IPv4: the route's rmx_expire),
+    /// "expires in …" / "expired" (IPv6: the neighbor cache expiry `ndp` shows) or "unknown"; IPv6 entries are
+    /// prefixed with the ND state ("stale, …")
     let status: String
     
     /// Link type as printed by `arp` ("ethernet", "bridge", …); empty when `arp` prints none
@@ -70,8 +72,11 @@ struct ArpResult {
     /// Timestamp when the ARP table was retrieved
     let timestamp: Date
     
+    /// Why the IPv6 neighbor table could not be read (the entries are IPv4 only then)
+    let ipv6Error: String?
+    
     /// Entries are sorted numerically by address (IPv4 before IPv6), then by interface
-    init(entries: [ArpEntry]) {
+    init(entries: [ArpEntry], ipv6Error: String? = nil) {
         let sorted = entries
             .map { (key: $0.addressSortKey, entry: $0) }
             .sorted { $0.key.lexicographicallyPrecedes($1.key) || ($0.key == $1.key && $0.entry.interface < $1.entry.interface) }
@@ -79,5 +84,6 @@ struct ArpResult {
         self.allEntries = sorted
         self.entriesByInterface = Dictionary(grouping: sorted) { $0.interface }
         self.timestamp = Date()
+        self.ipv6Error = ipv6Error
     }
 }

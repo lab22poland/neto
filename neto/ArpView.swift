@@ -40,7 +40,7 @@ struct ArpView: View {
                 .fontWeight(.bold)
                 .accessibilityIdentifier("arp.header")
             
-            Text("Browse the system's Address Resolution Protocol (ARP) table")
+            Text("Browse the system's IPv4 ARP table and IPv6 neighbor (NDP) table")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
             
@@ -96,10 +96,17 @@ struct ArpView: View {
     @ViewBuilder
     private var errorSection: some View {
         if let errorMessage = viewModel.errorMessage {
-                            Text(errorMessage)
-                    .foregroundColor(.secondary)
-                    .font(.caption)
-                    .accessibilityIdentifier("arp.error")
+            Text(errorMessage)
+                .foregroundColor(.secondary)
+                .font(.caption)
+                .accessibilityIdentifier("arp.error")
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        if let ipv6Error = viewModel.arpResult?.ipv6Error {
+            Text("The IPv6 neighbor table could not be read, only IPv4 entries are shown: \(ipv6Error)")
+                .foregroundColor(.secondary)
+                .font(.caption)
+                .accessibilityIdentifier("arp.ipv6Error")
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

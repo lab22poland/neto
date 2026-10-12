@@ -289,3 +289,54 @@ struct DNSWireReviewTests {
         #expect(DNSWire.header(broken).map { $0.flags & 0x0200 != 0 } == true)
     }
 }
+
+/// Which server answered: the connection's remote address with the name it was addressed to, like dig 9.18's
+/// ";; SERVER: 1.1.1.1#853(one.one.one.one) (TLS)" (bin/dig/dig.c; the dig 9.10.6 on macOS has no +tls/+https)
+struct DNSServerEndpointTests {
+
+    private let doh = URL(string: "https://cloudflare-dns.com/dns-query")!
+
+    @Test func digServerLineUsesTheRemoteAddress() {
+        let dot = DNSServerEndpoint(address: "1.0.0.1", port: 853, host: "one.one.one.one", url: nil, httpProtocol: nil)
+        #expect(dot.digServerLine(.tls) == ";; SERVER: 1.0.0.1#853(one.one.one.one) (TLS)")
+        let udp = DNSServerEndpoint(address: "9.9.9.9", port: 53, host: "9.9.9.9", url: nil, httpProtocol: nil)
+        #expect(udp.digServerLine(.udp) == ";; SERVER: 9.9.9.9#53(9.9.9.9) (UDP)")
+        #expect(udp.digServerLine(.tcp) == ";; SERVER: 9.9.9.9#53(9.9.9.9) (TCP)")
+    }
+
+    @Test func unknownAddressShowsTheHostNotAnIP() {
+        let endpoint = DNSServerEndpoint(address: nil, port: 443, host: "cloudflare-dns.com", url: doh, httpProtocol: nil)
+        #expect(endpoint.digServerLine(.https) == ";; SERVER: cloudflare-dns.com#443(cloudflare-dns.com) (HTTPS)")
+        #expect(endpoint.summary(.https) == "cloudflare-dns.com#443 (https://cloudflare-dns.com/dns-query) over DoH")
+    }
+
+    @Test func summaryNamesTheURLAndHTTPVersion() {
+        let endpoint = DNSServerEndpoint(address: "104.16.248.249", port: 443, host: "cloudflare-dns.com", url: doh, httpProtocol: "h3")
+        #expect(endpoint.summary(.https) == "104.16.248.249#443 (https://cloudflare-dns.com/dns-query) over DoH, h3")
+        let udp = DNSServerEndpoint(address: "1.1.1.1", port: 53, host: "1.1.1.1", url: nil, httpProtocol: nil)
+        #expect(udp.summary(.udp) == "1.1.1.1#53 over UDP")
+    }
+
+    @Test func dohTimeExcludesNameLookupAndHandshake() {
+        let fetchStart = Date(timeIntervalSince1970: 1000)
+        // A cache lookup without a remote, then the network load: connect + TLS took 60 ms, request→response 15 ms
+        let transactions = [
+            DoHTransaction(isNetworkLoad: false, requestStart: fetchStart, responseEnd: fetchStart.addingTimeInterval(0.010),
+                           remoteAddress: nil, remotePort: nil, protocolName: nil),
+            DoHTransaction(isNetworkLoad: true, requestStart: fetchStart.addingTimeInterval(0.060),
+                           responseEnd: fetchStart.addingTimeInterval(0.075), remoteAddress: "104.16.248.249",
+                           remotePort: 443, protocolName: "h2"),
+        ]
+        let measurement = DnsManager.dohMeasurement(transactions, url: doh, fallbackMilliseconds: 85)
+        #expect(abs(measurement.milliseconds - 15) < 0.001)
+        #expect(measurement.endpoint == DNSServerEndpoint(address: "104.16.248.249", port: 443, host: "cloudflare-dns.com",
+                                                          url: doh, httpProtocol: "h2"))
+    }
+
+    @Test func dohWithoutMetricsFallsBackToTheWallClock() {
+        let url = URL(string: "https://doh.example:8443/dns-query")!
+        let measurement = DnsManager.dohMeasurement([], url: url, fallbackMilliseconds: 85)
+        #expect(measurement.milliseconds == 85)
+        #expect(measurement.endpoint == DNSServerEndpoint(address: nil, port: 8443, host: "doh.example", url: url, httpProtocol: nil))
+    }
+}

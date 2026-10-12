@@ -164,7 +164,7 @@ See [LICENSE](LICENSE) file for complete license terms.
 ## 👨‍💻 Author
 
 **Sergii Solianyk**  
-📧 sergii.solyanik@lab22.pl  
+📧 sergii.solianyk@lab22.pl  
 🏢 Lab22 Poland Sp. z o.o.
 
 ## 🔮 Roadmap
@@ -198,7 +198,7 @@ This project follows Lab22 Poland development standards. For contributions:
 ## 🆘 Support
 
 For technical support or questions:
-- 📧 Email: sergii.solyanik@lab22.pl
+- 📧 Email: sergii.solianyk@lab22.pl
 - 🏢 Company: Lab22 Poland Sp. z o.o.
 
 ---
