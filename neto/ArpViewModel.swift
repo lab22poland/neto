@@ -90,6 +90,9 @@ final class ArpViewModel: ObservableObject {
                     return
                 }
                 
+                // Old entries (and their IPv6 note) must not stay under the new error
+                self.arpResult = nil
+                self.selectedInterface = "All"
                 self.errorMessage = error.localizedDescription
             }
             
