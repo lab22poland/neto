@@ -77,6 +77,9 @@ struct TracerouteManagerLogicTests {
         let result = TracerouteResult(hopNumber: 4, success: true, ipAddress: "10.0.0.1", responseTime: 2, message: "",
                                       probeTimes: [1, 2, nil, 3], probeAddresses: ["10.0.0.1", "10.0.0.2", nil, "10.0.0.2"])
         #expect(result.formattedProbeTimes == "1.00 ms  (10.0.0.2) 2.00 ms  *  3.00 ms")
+        let back = TracerouteResult(hopNumber: 4, success: true, ipAddress: "10.0.0.1", responseTime: 2, message: "",
+                                    probeTimes: [1, 2, 3], probeAddresses: ["10.0.0.1", "10.0.0.2", "10.0.0.1"])
+        #expect(back.formattedProbeTimes == "1.00 ms  (10.0.0.2) 2.00 ms  (10.0.0.1) 3.00 ms")
     }
 
     @Test func probeTimesFormatting() {
@@ -121,6 +124,8 @@ final class TracerouteLoopbackTests: XCTestCase {
         XCTAssertEqual(results.first?.ipAddress, "127.0.0.1")
         XCTAssertEqual(results.first?.probeTimes.count, TracerouteManager.probesPerHop)
         XCTAssertTrue(results.first?.probeTimes.allSatisfy { $0 != nil } == true)
+        XCTAssertEqual(results.first?.probeAddresses, ["127.0.0.1", "127.0.0.1", "127.0.0.1"])
+        XCTAssertFalse(results.first?.formattedProbeTimes.contains("(") ?? true, "one address per hop needs no annotation")
     }
 
     func testInvalidHostReportsErrorAndCompletesOnce() {

@@ -46,6 +46,11 @@ final class TracerouteManager {
     /// Set when receiving fails hard (e.g. EPERM in the sandbox); ends the run
     private var socketError: Error?
 
+    deinit {
+        // Close the socket if the manager goes away during a run
+        readSource?.cancel()
+    }
+
     // MARK: - Public Methods
 
     /// Traces the route to the specified host
@@ -333,8 +338,10 @@ final class TracerouteManager {
         socketGeneration += 1
         let generation = socketGeneration
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
-        source.setEventHandler { [weak self] in
+        source.setEventHandler { [weak self, weak source] in
             let (received, error) = Self.readReplies(fd: fd, family: family, identifier: identifier)
+            // Cancel right here on a hard error: the read source is level-triggered and would fire again immediately
+            if error != nil { source?.cancel() }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.record(received, error: error, generation: generation) }
             }
