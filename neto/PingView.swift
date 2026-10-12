@@ -178,11 +178,20 @@ struct PingView: View {
                 Spacer()
                 if !viewModel.pingResults.isEmpty {
                     Button("Clear") {
-                        viewModel.pingResults.removeAll()
+                        viewModel.clearResults()
                     }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("ping.clear")
                 }
+            }
+            
+            if let stats = viewModel.statistics {
+                // The resolved address, like ping's first line "PING host (address): N data bytes"
+                Text(stats.host == stats.address ? "PING \(stats.address)" : "PING \(stats.host) (\(stats.address))")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("ping.target")
             }
             
             if viewModel.pingResults.isEmpty {
@@ -206,30 +215,38 @@ struct PingView: View {
     
     private var statisticsSection: some View {
         Group {
-            if !viewModel.pingResults.isEmpty {
+            if let stats = viewModel.statistics {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Statistics")
                         .font(.headline)
                     
-                    let stats = viewModel.pingStatistics
                     VStack(spacing: 4) {
                         HStack {
-                            Text("Packets: \(stats.totalPings) sent, \(stats.successCount) received")
+                            Text("Packets: \(stats.transmitted) sent, \(stats.received) received")
                                 .accessibilityIdentifier("ping.stats")
+                            if stats.late > 0 {
+                                // Like `ping -W`: late replies count as received, but are reported separately
+                                Text("(\(stats.late) after timeout)")
+                                    .foregroundColor(.secondary)
+                                    .accessibilityIdentifier("ping.late")
+                            }
                             Spacer()
                             Text("Loss: \(stats.formattedPacketLoss)")
                                 .foregroundColor(stats.packetLoss > 0 ? .secondary : .primary)
                         }
                         
-                        HStack {
-                            Text("Min: \(stats.formattedMinTime)")
-                            Spacer()
-                            Text("Max: \(stats.formattedMaxTime)")
-                        }
-                        
-                        HStack {
-                            Text("Average: \(stats.formattedAvgTime)")
-                            Spacer()
+                        // Like ping, no round-trip line without replies
+                        if stats.received > 0 {
+                            HStack {
+                                Text("Min: \(stats.formattedMinTime)")
+                                Spacer()
+                                Text("Max: \(stats.formattedMaxTime)")
+                            }
+                            
+                            HStack {
+                                Text("Average: \(stats.formattedAvgTime)")
+                                Spacer()
+                            }
                         }
                     }
                     .font(.caption)

@@ -18,6 +18,8 @@ final class PingViewModel: ObservableObject {
     
     @Published var targetHost: String = ""
     @Published var pingResults: [PingResult] = []
+    /// Statistics of the current or last run, nil before the host is resolved (and after a failed start or Clear)
+    @Published var statistics: PingStatistics?
     @Published var isPinging: Bool = false
     @Published var errorMessage: String?
     @Published var pingCount: Int = 5
@@ -31,8 +33,6 @@ final class PingViewModel: ObservableObject {
     private var pingTask: Task<Void, Never>?
     /// Identifies the current run, so a late completion of a stopped run cannot reset a newer one
     private var currentRunID: UUID?
-    /// The "Ping stopped by user" row is not a packet and is left out of the statistics
-    private var stopRowID: UUID?
     
     // MARK: - Public Methods
     
@@ -53,6 +53,7 @@ final class PingViewModel: ObservableObject {
         isPinging = true
         errorMessage = nil
         pingResults.removeAll()
+        statistics = nil
         
         // Create ping configuration
         let config = PingManager.PingConfig(
@@ -70,7 +71,12 @@ final class PingViewModel: ObservableObject {
             to: host,
             config: config,
             onResult: { [weak self] result in
+                guard self?.currentRunID == runID else { return }
                 self?.handlePingResult(result)
+            },
+            onStatistics: { [weak self] statistics in
+                guard self?.currentRunID == runID else { return }
+                self?.statistics = statistics
             },
             onComplete: { [weak self] in
                 guard self?.currentRunID == runID else { return }
@@ -79,25 +85,22 @@ final class PingViewModel: ObservableObject {
         )
     }
     
-    /// Stops the current ping operation
+    /// Stops the current ping operation. The statistics keep what was sent so far; packets still
+    /// in flight count as lost, like the summary ping prints on Ctrl-C.
     func stopPing() {
+        guard isPinging else { return }
         pingTask?.cancel()
         pingManager.stopPing()
         currentRunID = nil
         isPinging = false
-        
-        // Add a final result to show the ping was stopped
-        if !pingResults.isEmpty {
-            let result = PingResult(
-                id: UUID(),
-                sequenceNumber: pingResults.count + 1,
-                success: false,
-                responseTime: 0,
-                message: "Ping stopped by user"
-            )
-            stopRowID = result.id
-            pingResults.append(result)
-        }
+        pingResults.append(PingResult(id: UUID(), sequenceNumber: pingResults.count + 1, kind: .stopped,
+                                      responseTime: 0, message: "Ping stopped by user"))
+    }
+    
+    /// Removes the result rows and the statistics
+    func clearResults() {
+        pingResults.removeAll()
+        statistics = nil
     }
     
     /// Checks if the target host input is valid
@@ -105,39 +108,15 @@ final class PingViewModel: ObservableObject {
         !targetHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     
-    /// Gets ping statistics
-    var pingStatistics: PingStatistics {
-        let packets = pingResults.filter { $0.id != stopRowID }
-        let successfulPings = packets.filter { $0.success }
-        let failedPings = packets.filter { !$0.success }
-        
-        let totalPings = packets.count
-        let successCount = successfulPings.count
-        let failureCount = failedPings.count
-        
-        let responseTimes = successfulPings.map { $0.responseTime }
-        let minTime = responseTimes.min() ?? 0
-        let maxTime = responseTimes.max() ?? 0
-        let avgTime = responseTimes.isEmpty ? 0 : responseTimes.reduce(0, +) / Double(responseTimes.count)
-        
-        let packetLoss = totalPings > 0 ? Double(failureCount) / Double(totalPings) * 100 : 0
-        
-        return PingStatistics(
-            totalPings: totalPings,
-            successCount: successCount,
-            failureCount: failureCount,
-            packetLoss: packetLoss,
-            minResponseTime: minTime,
-            maxResponseTime: maxTime,
-            avgResponseTime: avgTime
-        )
-    }
-    
     // MARK: - Private Methods
     
-    /// Handles individual ping results
+    /// Handles individual ping results; a failed start is an error, not a result row
     private func handlePingResult(_ result: PingResult) {
-        pingResults.append(result)
+        if result.kind == .startFailure {
+            errorMessage = result.message
+        } else {
+            pingResults.append(result)
+        }
     }
     
     /// Handles completion of all ping operations
@@ -153,36 +132,3 @@ final class PingViewModel: ObservableObject {
         pingManager.stopPing()
     }
 }
-
-// MARK: - Ping Statistics
-
-/// Statistics for a ping operation
-struct PingStatistics {
-    let totalPings: Int
-    let successCount: Int
-    let failureCount: Int
-    let packetLoss: Double
-    let minResponseTime: Double
-    let maxResponseTime: Double
-    let avgResponseTime: Double
-    
-    /// Formatted packet loss percentage
-    var formattedPacketLoss: String {
-        String(format: "%.1f%%", packetLoss)
-    }
-    
-    /// Formatted minimum response time
-    var formattedMinTime: String {
-        String(format: "%.2fms", minResponseTime)
-    }
-    
-    /// Formatted maximum response time
-    var formattedMaxTime: String {
-        String(format: "%.2fms", maxResponseTime)
-    }
-    
-    /// Formatted average response time
-    var formattedAvgTime: String {
-        String(format: "%.2fms", avgResponseTime)
-    }
-} 
