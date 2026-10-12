@@ -218,6 +218,7 @@ final class DnsManager {
     /// The time and the server address come from URLSessionTaskMetrics: from sending the request to the end of the
     /// response, without the host name lookup and the TLS/QUIC handshake (the UDP/TCP/DoT clocks also start on a
     /// ready connection).
+    /// Behind an HTTP proxy the metrics' remote address is the proxy's, not the DoH server's.
     private func httpsExchange(_ query: [UInt8], url: URL) async throws -> DNSExchange {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
@@ -461,7 +462,9 @@ private final class DNSCompletion: @unchecked Sendable {
 }
 
 extension DNSServerEndpoint {
-    /// IP address and port of a resolved connection endpoint; nil for a name or other endpoint kinds
+    /// IP address and port of a resolved connection endpoint; nil for a name or other endpoint kinds.
+    /// A scoped IPv6 address keeps its zone as an interface name ("fe80::1%lo0"), which is easier to read than
+    /// the numeric scope ID dig's isc_sockaddr_format prints ("fe80::1%1").
     static func address(of endpoint: NWEndpoint?) -> (address: String, port: UInt16)? {
         guard case .hostPort(let host, let port)? = endpoint else { return nil }
         switch host {

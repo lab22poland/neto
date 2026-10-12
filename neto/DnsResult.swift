@@ -60,13 +60,16 @@ struct DnsResult: Identifiable {
 
     /// Line under the records: "Query time: 13 ms · Cloudflare · 1.0.0.1#853 (one.one.one.one) over DoT · 72 bytes"
     var summary: String {
-        let connection = endpoint.map { $0.summary(transport) } ?? "\(server.address) over \(transport.rawValue)"
+        // Results with a response always carry the endpoint; error results show only the error
+        guard message != nil, let endpoint else { return error ?? "" }
+        let connection = endpoint.summary(transport)
         return String(format: "Query time: %.0f ms · %@ · %@ · %d bytes", queryTime, server.label, connection, responseSize)
     }
 
     /// Whole answer in dig's text layout (sections, query time, server), for copying
     var digText: String {
-        guard let message else { return ";; \(error ?? "")" }
+        // Results with a response always carry the endpoint (both come from the same initializer)
+        guard let message, let endpoint else { return ";; \(error ?? "")" }
         // dig counts the EDNS OPT pseudo-record in ADDITIONAL
         let additionalCount = message.additional.count + (message.ednsUDPSize == nil ? 0 : 1)
         var lines = [";; ->>HEADER<<- opcode: \(message.opcodeName), status: \(message.rcodeName), id: \(message.id)",
@@ -78,7 +81,7 @@ struct DnsResult: Identifiable {
             lines += ["", ";; \(title) SECTION:"] + records.map(\.presentation)
         }
         lines += ["", String(format: ";; Query time: %.0f msec", queryTime),
-                  endpoint.map { $0.digServerLine(transport) } ?? ";; SERVER: \(server.address)",
+                  endpoint.digServerLine(transport),
                   ";; MSG SIZE  rcvd: \(responseSize)"]
         return lines.joined(separator: "\n")
     }

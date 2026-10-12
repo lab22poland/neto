@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import Network
 import Testing
 @testable import neto
 
@@ -315,6 +316,20 @@ struct DNSServerEndpointTests {
         #expect(endpoint.summary(.https) == "104.16.248.249#443 (https://cloudflare-dns.com/dns-query) over DoH, h3")
         let udp = DNSServerEndpoint(address: "1.1.1.1", port: 53, host: "1.1.1.1", url: nil, httpProtocol: nil)
         #expect(udp.summary(.udp) == "1.1.1.1#53 over UDP")
+    }
+
+    @Test func connectionEndpointAddress() {
+        func address(_ host: String) -> String? {
+            DNSServerEndpoint.address(of: .hostPort(host: NWEndpoint.Host(host), port: 853))?.address
+        }
+        #expect(address("1.0.0.1") == "1.0.0.1")
+        #expect(address("2606:4700:4700::1111") == "2606:4700:4700::1111")
+        // The zone stays an interface name, unlike dig's numeric scope ID
+        #expect(address("fe80::1%lo0") == "fe80::1%lo0")
+        #expect(address("dns.google") == nil, "an unresolved name is not an address")
+        #expect(DNSServerEndpoint.address(of: .hostPort(host: "1.0.0.1", port: 853))?.port == 853)
+        #expect(DNSServerEndpoint.address(of: .service(name: "x", type: "_dns._udp", domain: "local.", interface: nil)) == nil)
+        #expect(DNSServerEndpoint.address(of: nil) == nil)
     }
 
     @Test func dohTimeExcludesNameLookupAndHandshake() {
