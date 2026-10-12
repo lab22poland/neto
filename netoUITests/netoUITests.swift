@@ -31,6 +31,7 @@ final class netoUITests: XCTestCase {
         let tools = [("ping", "ping.header"),
                      ("traceroute", "traceroute.header"),
                      ("whois", "whois.header"),
+                     ("dns", "dns.header"),
                      ("arp", "arp.header"),
                      ("about", "about.header")]
         for (tool, header) in tools {
@@ -117,6 +118,19 @@ final class netoUITests: XCTestCase {
         host.typeText("127.0.0.1\n")
         XCTAssertTrue(element("traceroute.destination").waitForExistence(timeout: 10), "Loopback must be reached at the first hop")
         XCTAssertTrue(waitForDisappearance(of: element("traceroute.stop"), timeout: 5), "Stop must disappear after the run")
+    }
+
+    @MainActor
+    func testDnsInputValidation() throws {
+        openTool("dns", expecting: "dns.header")
+        let name = element("dns.name")
+        let lookup = element("dns.lookup")
+        XCTAssertFalse(lookup.isEnabled, "Look Up must be disabled for an empty name")
+        name.tap()
+        name.typeText("bad..name")
+        XCTAssertFalse(lookup.isEnabled, "An empty label is not a valid DNS name")
+        name.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 9) + "example.com")
+        XCTAssertTrue(lookup.isEnabled)
     }
 
     // MARK: - ARP

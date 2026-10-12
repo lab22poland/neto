@@ -23,6 +23,8 @@ struct ContentView: View {
                     TracerouteView()
                 case .whois:
                     WhoisView()
+                case .dns:
+                    DnsView()
                 case .arp:
                     ArpView()
                 case .about:
@@ -56,6 +58,7 @@ enum NetworkTool: String, CaseIterable, Identifiable {
     case ping = "ping"
     case traceroute = "traceroute"
     case whois = "whois"
+    case dns = "dns"
     case arp = "arp"
     case about = "about"
     
@@ -69,6 +72,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
             return "Traceroute"
         case .whois:
             return "WHOIS"
+        case .dns:
+            return "DNS"
         case .arp:
             return "ARP"
         case .about:
@@ -84,6 +89,8 @@ enum NetworkTool: String, CaseIterable, Identifiable {
             return "point.topleft.down.curvedto.point.bottomright.up"
         case .whois:
             return "doc.text.magnifyingglass"
+        case .dns:
+            return "globe"
         case .arp:
             return "table"
         case .about:

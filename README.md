@@ -173,10 +173,10 @@ See [LICENSE](LICENSE) file for complete license terms.
 - **Ping Tool**: ICMP connectivity testing
 - **Traceroute Tool**: Network path analysis  
 - **WHOIS Tool**: RFC 3912 compliant queries (FreeBSD compatible)
+- **DNS Lookup**: dig-like queries to the system resolver, Cloudflare, Google, Quad9 or any server over UDP, TCP, DNS over TLS or DNS over HTTPS; RCODE, flags, answer/authority/additional sections, query time
 - **ARP Browser**: IPv4 ARP and IPv6 neighbor tables, matching `arp -an` / `ndp -an` (macOS; iOS/iPadOS do not expose the table)
 
 ### 🚧 **In Development**
-- [ ] **DNS Lookup**: Domain name resolution tools
 - [ ] **Port Scanner**: TCP/UDP port connectivity testing
 
 ### 📋 **Planned Features**

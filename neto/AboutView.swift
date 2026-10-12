@@ -82,6 +82,14 @@ struct AboutView: View {
                         .font(.body)
                         
                         HStack {
+                            Image(systemName: "globe")
+                                .foregroundColor(.primary)
+                                .frame(width: 20)
+                            Text("DNS Lookup - Queries like dig over UDP, TCP, DNS over TLS and DNS over HTTPS")
+                        }
+                        .font(.body)
+                        
+                        HStack {
                             Image(systemName: "table")
                                 .foregroundColor(.primary)
                                 .frame(width: 20)
