@@ -35,12 +35,15 @@ final class TracerouteManager {
     private var family: Int32 = AF_INET
     private var identifier: UInt16 = 0
     private var nextSequenceNumber: UInt16 = 0
-    /// The probe in flight and its send time on the monotonic clock (DispatchTime nanoseconds). Like traceroute,
-    /// only a reply to this probe counts; a late reply to an earlier probe is ignored.
-    private var awaitedProbe: (sequenceNumber: UInt16, sentAt: UInt64)?
+    /// The probe in flight. Like traceroute, only a reply to this probe within its timeout counts;
+    /// a late reply to an earlier probe is ignored.
+    private var awaitedProbe: AwaitedProbe?
     private var awaitedReply: ProbeAnswer?
-    /// Answers per hop row of the current run, so a router name that arrives later can re-deliver the latest row
-    private var hops: [UUID: (hopNumber: Int, probes: [ProbeAnswer?])] = [:]
+    /// Resumed by the reply, the probe's timer, a socket error or cancellation, whichever comes first
+    private var replyWaiter: CheckedContinuation<Void, Never>?
+    private var replyWaiterToken = 0
+    /// Outcomes per hop row of the current run, so a router name that arrives later can re-deliver the latest row
+    private var hops: [UUID: (hopNumber: Int, probes: [ProbeOutcome])] = [:]
     private var hostnames: [UUID: String] = [:]
     private var runTask: Task<Void, Never>?
     /// Incremented per socket, so replies read from a closed socket cannot reach a newer run
@@ -50,6 +53,22 @@ final class TracerouteManager {
     /// Set when receiving fails hard (e.g. EPERM in the sandbox); ends the run
     private var socketError: Error?
 
+    /// A probe in flight, with its send time and reply deadline on the monotonic clock (DispatchTime nanoseconds)
+    struct AwaitedProbe {
+        let sequenceNumber: UInt16
+        let sentAt: UInt64
+        let deadline: UInt64
+    }
+
+    /// A probe reply as read from the socket, with its receive time on the monotonic clock
+    struct ReceivedReply {
+        let reply: ICMPPacket.ProbeReply
+        let address: String
+        let receivedAt: UInt64
+        /// TTL of the received IPv4 packet (nil for IPv6)
+        let ttl: UInt8?
+    }
+
     /// The reply to one probe
     struct ProbeAnswer: Equatable {
         /// Round-trip time in milliseconds
@@ -57,6 +76,22 @@ final class TracerouteManager {
         /// Address that answered
         let address: String
         let reply: ICMPPacket.ProbeReply
+        /// TTL of the reply (IPv4 only); traceroute marks replies that arrive with TTL <= 1 with "!"
+        let ttl: UInt8?
+    }
+
+    /// What happened to one probe
+    enum ProbeOutcome: Equatable {
+        case answered(ProbeAnswer)
+        /// No reply within the timeout ("*")
+        case noReply
+        /// The probe could not be sent; carries the error as traceroute prints it, e.g. "sendto: Socket is not connected"
+        case sendFailed(String)
+
+        var answer: ProbeAnswer? {
+            if case .answered(let answer) = self { return answer }
+            return nil
+        }
     }
 
     /// What one reply means for its hop, as decided by traceroute.c (IPv4) and traceroute6.c (IPv6)
@@ -82,9 +117,11 @@ final class TracerouteManager {
     ///   - maxHops: Maximum TTL / hop limit to probe
     ///   - timeout: Seconds to wait for the reply to each probe (traceroute `-w`, default 5); probes go out one after another
     ///   - onResult: Called on the main actor after every probe with the hop's row so far; the same row (same `id`)
-    ///     comes again with the next probe and when the router's name is resolved, even after the run has ended
+    ///     comes again with the next probe and when the router's name is resolved, also after the run has ended or
+    ///     was cancelled (until the next run starts)
     ///   - onComplete: Called exactly once when the run ends, including after cancellation; carries the error that
-    ///     ended the run (resolution, socket or send failure), nil when it finished or was cancelled
+    ///     ended the run (resolution or socket failure), nil when it finished or was cancelled. A probe that cannot
+    ///     be sent is not an error of the run: it shows in its hop row and the trace goes on, like traceroute.
     /// - Returns: A Task that can be cancelled
     @MainActor
     func performTraceroute(
@@ -100,9 +137,7 @@ final class TracerouteManager {
         let task = Task { @MainActor [weak self] in
             await previousTask?.value
             guard let self else { onComplete(nil); return }
-            let error = await self.trace(host: host, maxHops: maxHops, timeout: timeout) { result in
-                if !Task.isCancelled { onResult(result) }
-            }
+            let error = await self.trace(host: host, maxHops: maxHops, timeout: timeout, onResult: onResult)
             self.closeSocket()
             onComplete(Task.isCancelled ? nil : error)
         }
@@ -209,7 +244,7 @@ final class TracerouteManager {
     /// Runs the trace like traceroute's main loop: per hop, probes go out one after another and each waits for its
     /// own reply or the timeout. Returns the error that ended the run, nil when it finished or was cancelled.
     @MainActor
-    private func trace(host: String, maxHops: Int, timeout: TimeInterval, deliver: @escaping (TracerouteResult) -> Void) async -> Error? {
+    private func trace(host: String, maxHops: Int, timeout: TimeInterval, onResult: @escaping (TracerouteResult) -> Void) async -> Error? {
         guard maxHops >= 1 else { return nil }
         let target: ResolvedHost
         do {
@@ -224,24 +259,30 @@ final class TracerouteManager {
             for hop in 1...maxHops {
                 try setHopLimit(hop)
                 let id = UUID()
-                var probes: [ProbeAnswer?] = []
+                var probes: [ProbeOutcome] = []
                 for _ in 0..<Self.probesPerHop {
                     if Task.isCancelled { return nil }
-                    let sequenceNumber = try sendProbe(to: target, hop: hop)
-                    await waitForReply(to: sequenceNumber, timeout: timeout)
-                    if let socketError { throw socketError }
-                    if Task.isCancelled { return nil }
-                    let answer = awaitedReply
+                    let outcome: ProbeOutcome
+                    if let failure = sendProbe(to: target, timeout: timeout) {
+                        // traceroute prints the error and goes on; nothing was sent, so there is nothing to wait for
+                        outcome = .sendFailed(failure)
+                    } else {
+                        await waitForReply()
+                        if let socketError { throw socketError }
+                        if Task.isCancelled { return nil }
+                        outcome = awaitedReply.map { .answered($0) } ?? .noReply
+                    }
                     awaitedProbe = nil
-                    probes.append(answer)
+                    awaitedReply = nil
+                    probes.append(outcome)
                     hops[id] = (hop, probes)
                     // Like traceroute, the router's name is looked up for the first address that answers
-                    if let answer, probes.compactMap({ $0 }).count == 1 {
-                        resolveName(of: id, address: answer.address, deliver: deliver)
+                    if let answer = outcome.answer, probes.compactMap(\.answer).count == 1 {
+                        resolveName(of: id, address: answer.address, deliver: onResult)
                     }
-                    deliver(makeResult(id: id))
+                    onResult(makeResult(id: id))
                 }
-                let verdicts = probes.compactMap { $0.map { Self.verdict(for: $0.reply, family: family) } }
+                let verdicts = probes.compactMap { $0.answer.map { Self.verdict(for: $0.reply, family: family, ttl: $0.ttl) } }
                 if Self.endsTrace(verdicts, family: family) { return nil }
             }
             return nil
@@ -250,12 +291,13 @@ final class TracerouteManager {
         }
     }
 
-    /// Builds the row of a hop from its answers so far and the router's name, if already known
+    /// Builds the row of a hop from its probe outcomes so far and the router's name, if already known
     @MainActor
     private func makeResult(id: UUID) -> TracerouteResult {
         let (hopNumber, probes) = hops[id] ?? (0, [])
-        let answered = probes.compactMap { $0 }
-        let verdicts = probes.map { $0.map { Self.verdict(for: $0.reply, family: family) } }
+        let answers = probes.map(\.answer)
+        let answered = answers.compactMap { $0 }
+        let verdicts = answers.map { $0.map { Self.verdict(for: $0.reply, family: family, ttl: $0.ttl) } }
         let routerAddress = answered.first?.address
         let reachedTarget = verdicts.contains { $0?.reachedTarget == true }
         let hostname = hostnames[id]
@@ -269,19 +311,28 @@ final class TracerouteManager {
             responseTime: times.isEmpty ? 0 : times.reduce(0, +) / Double(times.count),
             message: formatHopMessage(ipAddress: routerAddress, hostname: hostname, isDestination: reachedTarget),
             isDestination: reachedTarget,
-            probeTimes: probes.map { $0?.time },
+            probeTimes: answers.map { $0?.time },
             probeAnnotations: verdicts.map { $0?.annotation },
-            probeAddresses: probes.map { $0?.address }
+            probeAddresses: answers.map { $0?.address },
+            probeErrors: probes.map { outcome in
+                if case .sendFailed(let error) = outcome { return error }
+                return nil
+            }
         )
     }
 
-    /// Classifies a probe reply like traceroute's `packet_ok` switch (IPv4) or traceroute6 (IPv6)
-    static func verdict(for reply: ICMPPacket.ProbeReply, family: Int32) -> ProbeVerdict {
+    /// Classifies a probe reply like traceroute's `packet_ok` switch (IPv4) or traceroute6 (IPv6). `ttl` is the
+    /// reply's IPv4 TTL: traceroute.c appends "!" to an echo reply or port unreachable that arrives with TTL <= 1.
+    static func verdict(for reply: ICMPPacket.ProbeReply, family: Int32, ttl: UInt8? = nil) -> ProbeVerdict {
+        let lowTTL = family == AF_INET && (ttl ?? UInt8.max) <= 1 ? "!" : nil
         switch reply {
         case .timeExceeded:
             return ProbeVerdict(annotation: nil, reachedTarget: false, unreachable: false)
         case .echoReply:
-            return ProbeVerdict(annotation: nil, reachedTarget: true, unreachable: false)
+            return ProbeVerdict(annotation: lowTTL, reachedTarget: true, unreachable: false)
+        case .parameterProblem:
+            // traceroute6: unrecognized Next Header means the target got the probe
+            return ProbeVerdict(annotation: "!H", reachedTarget: true, unreachable: false)
         case .destinationUnreachable(_, let code):
             if family == AF_INET6 {
                 // RFC 4443 codes as printed by traceroute6; port unreachable means the target was reached,
@@ -296,7 +347,7 @@ final class TracerouteManager {
                 }
             }
             switch code {
-            case 3: return ProbeVerdict(annotation: nil, reachedTarget: true, unreachable: false)
+            case 3: return ProbeVerdict(annotation: lowTTL, reachedTarget: true, unreachable: false)
             case 2: return ProbeVerdict(annotation: "!P", reachedTarget: true, unreachable: false)
             default: return ProbeVerdict(annotation: unreachableAnnotation(code: code), reachedTarget: false, unreachable: true)
             }
@@ -312,6 +363,15 @@ final class TracerouteManager {
         return unreachable > 0 && unreachable >= limit
     }
 
+    /// The first received reply that answers the probe in flight: same sequence number, received after the send
+    /// and not after the deadline. Replies to earlier probes and late replies are ignored like in traceroute.
+    static func answer(from received: [ReceivedReply], to probe: AwaitedProbe) -> ProbeAnswer? {
+        guard let item = received.first(where: {
+            $0.reply.sequenceNumber == probe.sequenceNumber && $0.receivedAt >= probe.sentAt && $0.receivedAt <= probe.deadline
+        }) else { return nil }
+        return ProbeAnswer(time: Double(item.receivedAt - probe.sentAt) / 1_000_000, address: item.address, reply: item.reply, ttl: item.ttl)
+    }
+
     /// Sets the TTL / hop limit of the following probes
     @MainActor
     private func setHopLimit(_ hop: Int) throws {
@@ -323,41 +383,58 @@ final class TracerouteManager {
         guard status == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
-    /// Sends one echo probe and returns its sequence number. A failed send (e.g. "Socket is not connected" for
-    /// 0.0.0.0) throws: traceroute prints the error and keeps waiting out every probe, the app reports it and stops.
+    /// Sends one echo probe and makes it the probe in flight. Returns the send error as traceroute prints it
+    /// (e.g. "sendto: Socket is not connected" for 0.0.0.0), or nil when the probe went out.
     @MainActor
-    private func sendProbe(to target: ResolvedHost, hop: Int) throws -> UInt16 {
+    private func sendProbe(to target: ResolvedHost, timeout: TimeInterval) -> String? {
         let sequenceNumber = nextSequenceNumber
         nextSequenceNumber &+= 1
         let packet = ICMPPacket.echoRequest(family: family, identifier: identifier, sequenceNumber: sequenceNumber, payload: Data(repeating: 0x4E, count: 24))
         awaitedReply = nil
-        awaitedProbe = (sequenceNumber, DispatchTime.now().uptimeNanoseconds)
+        let sentAt = DispatchTime.now().uptimeNanoseconds
+        awaitedProbe = AwaitedProbe(sequenceNumber: sequenceNumber, sentAt: sentAt, deadline: sentAt + UInt64(timeout * 1_000_000_000))
         let sent = packet.withUnsafeBytes { bytes in
             target.address.withUnsafeBytes { address in
                 sendto(socketFD, bytes.baseAddress, bytes.count, 0,
                        address.bindMemory(to: sockaddr.self).baseAddress, socklen_t(target.address.count))
             }
         }
-        guard sent == packet.count else {
-            let reason = sent < 0 ? String(cString: strerror(errno)) : "wrote \(sent) of \(packet.count) bytes"
-            awaitedProbe = nil
-            throw TracerouteError.sendFailed(hop: hop, reason: reason)
-        }
-        return sequenceNumber
+        guard sent != packet.count else { return nil }
+        let failure = sent < 0 ? "sendto: " + String(cString: strerror(errno)) : "sendto: wrote \(sent) of \(packet.count) bytes"
+        awaitedProbe = nil
+        return failure
     }
 
-    /// Waits until the probe is answered or `timeout` seconds after it was sent (traceroute's `wait_for_reply`)
+    /// Suspends until the probe in flight is answered, its deadline passes (traceroute's `wait_for_reply`),
+    /// receiving fails or the run is cancelled
     @MainActor
-    private func waitForReply(to sequenceNumber: UInt16, timeout: TimeInterval) async {
-        guard let sentAt = awaitedProbe?.sentAt else { return }
-        let deadline = sentAt + UInt64(timeout * 1_000_000_000)
-        while !Task.isCancelled, socketError == nil, awaitedReply == nil, DispatchTime.now().uptimeNanoseconds < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+    private func waitForReply() async {
+        guard let probe = awaitedProbe, awaitedReply == nil, socketError == nil, !Task.isCancelled else { return }
+        replyWaiterToken += 1
+        let token = replyWaiterToken
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                replyWaiter = continuation
+                DispatchQueue.main.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: probe.deadline)) { [weak self] in
+                    MainActor.assumeIsolated { self?.resumeReplyWaiter(token: token) }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.resumeReplyWaiter(token: token) }
         }
+    }
+
+    /// Resumes the waiting trace loop; a token from an earlier wait does nothing
+    @MainActor
+    private func resumeReplyWaiter(token: Int? = nil) {
+        guard token == nil || token == replyWaiterToken, let waiter = replyWaiter else { return }
+        replyWaiter = nil
+        waiter.resume()
     }
 
     /// Looks up the router's name in the background and re-delivers the hop's latest row with it. There is no
-    /// time limit (traceroute resolves synchronously); a name that arrives after the run is still delivered.
+    /// time limit (traceroute resolves synchronously); a name that arrives after the run ended or was stopped
+    /// is still delivered, but not once a newer run has started.
     @MainActor
     private func resolveName(of id: UUID, address: String, deliver: @escaping (TracerouteResult) -> Void) {
         let generation = socketGeneration
@@ -390,14 +467,19 @@ final class TracerouteManager {
 
         // Replies are read and timestamped off the main thread, so main-thread latency does not inflate the RTT;
         // the results are then recorded on the main actor.
+        // Only the main actor cancels the source, and only its cancel handler closes the descriptor (on readQueue,
+        // after the last read). closeSocket() forgets the fd on main in the same step, so no send or setsockopt
+        // can reach a closed or reused descriptor.
         let identifier = self.identifier
         socketGeneration += 1
         let generation = socketGeneration
+        let failed = ReadFailure()
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
-        source.setEventHandler { [weak self, weak source] in
+        source.setEventHandler { [weak self] in
+            // After a hard error, stop reading until the main actor cancels the source
+            guard !failed.isSet else { return }
             let (received, error) = Self.readReplies(fd: fd, family: family, identifier: identifier)
-            // Cancel right here on a hard error: the read source is level-triggered and would fire again immediately
-            if error != nil { source?.cancel() }
+            if error != nil { failed.set() }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.record(received, error: error, generation: generation) }
             }
@@ -419,13 +501,6 @@ final class TracerouteManager {
         socketFD = -1
     }
 
-    /// A probe reply as read from the socket, with its receive time on the monotonic clock
-    private struct ReceivedReply {
-        let reply: ICMPPacket.ProbeReply
-        let address: String
-        let receivedAt: UInt64
-    }
-
     /// Drains the socket (runs on `readQueue`). Every ICMP socket sees all ICMP traffic of the host,
     /// so only replies to our identifier are kept. Returns a hard error (e.g. sandbox deny) if receiving fails.
     private static func readReplies(fd: Int32, family: Int32, identifier: UInt16) -> ([ReceivedReply], Error?) {
@@ -444,26 +519,27 @@ final class TracerouteManager {
             }
             guard count > 0 else { return (received, nil) }
             let now = DispatchTime.now().uptimeNanoseconds
-            guard let reply = ICMPPacket.probeReply(in: Data(buffer[0..<count]), family: family, identifier: identifier) else { continue }
+            let packet = Data(buffer[0..<count])
+            guard let reply = ICMPPacket.probeReply(in: packet, family: family, identifier: identifier) else { continue }
             let address = withUnsafeBytes(of: &from) { numericHost(Data($0.prefix(Int(fromLength)))) } ?? "?"
-            received.append(ReceivedReply(reply: reply, address: address, receivedAt: now))
+            received.append(ReceivedReply(reply: reply, address: address, receivedAt: now,
+                                          ttl: ICMPPacket.receivedTTL(in: packet, family: family)))
         }
     }
 
-    /// Records the first reply to the probe in flight; replies to earlier probes are ignored like in traceroute
+    /// Records the reply to the probe in flight and wakes the trace loop
     @MainActor
     private func record(_ received: [ReceivedReply], error: Error?, generation: Int) {
         guard generation == socketGeneration else { return }
-        for item in received {
-            guard let awaitedProbe, awaitedReply == nil,
-                  item.reply.sequenceNumber == awaitedProbe.sequenceNumber,
-                  item.receivedAt >= awaitedProbe.sentAt else { continue }
-            awaitedReply = ProbeAnswer(time: Double(item.receivedAt - awaitedProbe.sentAt) / 1_000_000, address: item.address, reply: item.reply)
+        if let awaitedProbe, awaitedReply == nil, let answer = Self.answer(from: received, to: awaitedProbe) {
+            awaitedReply = answer
+            resumeReplyWaiter()
         }
         if let error, socketError == nil {
-            // Stop reading instead of spinning on the read source; the trace loop reports the error
+            // The trace loop reports the error and stops
             socketError = error
             closeSocket()
+            resumeReplyWaiter()
         }
     }
 
@@ -540,6 +616,24 @@ final class TracerouteManager {
 
 // MARK: - Supporting Types
 
+/// Set once on the read queue after a hard receive error, so the level-triggered read source stops reading
+private final class ReadFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+}
+
 /// Resumes a continuation exactly once from whichever thread gets there first
 private final class ResumeOnce<T>: @unchecked Sendable {
     private let lock = NSLock()
@@ -575,7 +669,6 @@ private final class ResumeOnce<T>: @unchecked Sendable {
 enum TracerouteError: LocalizedError {
     case invalidHost(String)
     case resolutionFailed(String, String)
-    case sendFailed(hop: Int, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -583,8 +676,6 @@ enum TracerouteError: LocalizedError {
             return message
         case .resolutionFailed(let host, let reason):
             return "Cannot resolve \(host): \(reason)"
-        case .sendFailed(let hop, let reason):
-            return "Cannot send the probe for hop \(hop): sendto: \(reason)"
         }
     }
 }

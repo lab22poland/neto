@@ -172,7 +172,7 @@ struct TracerouteView: View {
     
     private var progressSection: some View {
         Group {
-            if viewModel.isTracing || !viewModel.tracerouteResults.isEmpty {
+            if viewModel.isTracing || !viewModel.tracerouteResults.isEmpty || viewModel.stoppedByUser {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("Progress")

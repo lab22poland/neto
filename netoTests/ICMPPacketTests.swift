@@ -148,6 +148,35 @@ struct ICMPProbeReplyTests {
         #expect(ICMPPacket.probeReply(in: packet, family: AF_INET, identifier: 0xBEEF) == .destinationUnreachable(sequenceNumber: 1, code: 1))
     }
 
+    @Test func reassemblyTimeExceededIsNotAProbeReply() {
+        // traceroute only accepts Time Exceeded in transit (code 0)
+        var packet = bytes(timeExceededFull)
+        packet[21] = 1
+        #expect(ICMPPacket.probeReply(in: packet, family: AF_INET, identifier: 0xBEEF) == nil)
+    }
+
+    @Test func receivedTTLComesFromTheIPv4Header() {
+        #expect(ICMPPacket.receivedTTL(in: bytes(timeExceededFull), family: AF_INET) == 0x40)
+        #expect(ICMPPacket.receivedTTL(in: bytes(timeExceededMinimal), family: AF_INET) == 0xFB)
+        #expect(ICMPPacket.receivedTTL(in: Data([3, 0, 0, 0]), family: AF_INET6) == nil)
+    }
+
+    @Test func ipv6ParameterProblemNextHeader() {
+        // Constructed: ICMPv6 Parameter Problem code 1 (unrecognized Next Header) quoting our echo request; code 0 is ignored
+        var packet = Data([4, 1, 0, 0, 0, 0, 0, 40])
+        var quotedHeader = Data(count: 40)
+        quotedHeader[0] = 0x60
+        quotedHeader[6] = 58
+        packet += quotedHeader
+        packet += ICMPPacket.echoRequest(family: AF_INET6, identifier: 0xBEEF, sequenceNumber: 3, payload: Data())
+        #expect(ICMPPacket.probeReply(in: packet, family: AF_INET6, identifier: 0xBEEF) == .parameterProblem(sequenceNumber: 3))
+        packet[1] = 0
+        #expect(ICMPPacket.probeReply(in: packet, family: AF_INET6, identifier: 0xBEEF) == nil)
+        packet[0] = 3
+        packet[1] = 1
+        #expect(ICMPPacket.probeReply(in: packet, family: AF_INET6, identifier: 0xBEEF) == nil, "fragment reassembly time exceeded is ignored")
+    }
+
     @Test func ipv6TimeExceededPerRFC4443() {
         // Constructed (not captured): ICMPv6 Time Exceeded, quoted 40-byte IPv6 header (next header 58), quoted echo request
         var packet = Data([3, 0, 0, 0, 0, 0, 0, 0])

@@ -27,7 +27,9 @@ final class TracerouteViewModel: ObservableObject {
     private let tracerouteManager = TracerouteManager()
     private var tracerouteTask: Task<Void, Never>?
     /// Identifies the current run, so late callbacks of a stopped run cannot touch a newer one
-    private var currentRunID: UUID?
+    private(set) var currentRunID: UUID?
+    /// The run the user stopped: its rows may still receive router names, but it adds no rows
+    private var stoppedRunID: UUID?
     /// Parameters of the current or last run, so the export does not pick up later edits of the form
     private(set) var runParameters: (host: String, maxHops: Int, timeout: Double)?
     
@@ -66,6 +68,7 @@ final class TracerouteViewModel: ObservableObject {
         errorMessage = nil
         tracerouteResults.removeAll()
         stoppedByUser = false
+        stoppedRunID = nil
         runParameters = (host, maxHops, timeout)
         let runID = UUID()
         currentRunID = runID
@@ -76,8 +79,7 @@ final class TracerouteViewModel: ObservableObject {
             maxHops: maxHops,
             timeout: timeout,
             onResult: { [weak self] result in
-                guard self?.currentRunID == runID else { return }
-                self?.handleTracerouteResult(result)
+                self?.handleResult(result, fromRun: runID)
             },
             onComplete: { [weak self] error in
                 guard self?.currentRunID == runID else { return }
@@ -91,6 +93,7 @@ final class TracerouteViewModel: ObservableObject {
         guard isTracing else { return }
         tracerouteTask?.cancel()
         tracerouteTask = nil
+        stoppedRunID = currentRunID
         currentRunID = nil
         isTracing = false
         stoppedByUser = true
@@ -128,7 +131,17 @@ final class TracerouteViewModel: ObservableObject {
     
     // MARK: - Private Methods
     
-    /// Appends a hop, or replaces it when the same row comes back with the router's name (internal for tests)
+    /// Routes a row of a run: rows of the current run are added or updated; a stopped run may only update its
+    /// existing rows (late router names); anything from an older run is dropped (internal for tests)
+    func handleResult(_ result: TracerouteResult, fromRun runID: UUID) {
+        if runID == currentRunID {
+            handleTracerouteResult(result)
+        } else if runID == stoppedRunID, let index = tracerouteResults.firstIndex(where: { $0.id == result.id }) {
+            tracerouteResults[index] = result
+        }
+    }
+    
+    /// Appends a hop, or replaces it when the same row comes back with the next probe or the router's name (internal for tests)
     func handleTracerouteResult(_ result: TracerouteResult) {
         if let index = tracerouteResults.firstIndex(where: { $0.id == result.id }) {
             // Same hop again, now with the router's name
@@ -151,6 +164,7 @@ final class TracerouteViewModel: ObservableObject {
         guard !isTracing else { return }
         
         currentRunID = nil
+        stoppedRunID = nil
         tracerouteResults.removeAll()
         errorMessage = nil
         stoppedByUser = false

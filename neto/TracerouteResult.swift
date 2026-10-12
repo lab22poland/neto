@@ -43,6 +43,9 @@ struct TracerouteResult: Identifiable {
     /// Address that answered each probe (nil = no reply); differs between probes when paths are load-balanced (ECMP)
     let probeAddresses: [String?]
     
+    /// Error of each probe that could not be sent (e.g. "sendto: Socket is not connected"), nil for a sent probe
+    let probeErrors: [String?]
+    
     init(
         id: UUID = UUID(),
         hopNumber: Int,
@@ -54,7 +57,8 @@ struct TracerouteResult: Identifiable {
         isDestination: Bool = false,
         probeTimes: [Double?] = [],
         probeAnnotations: [String?] = [],
-        probeAddresses: [String?] = []
+        probeAddresses: [String?] = [],
+        probeErrors: [String?] = []
     ) {
         self.id = id
         self.hopNumber = hopNumber
@@ -67,16 +71,23 @@ struct TracerouteResult: Identifiable {
         self.probeTimes = probeTimes
         self.probeAnnotations = probeAnnotations
         self.probeAddresses = probeAddresses
+        self.probeErrors = probeErrors
     }
     
-    /// Probe columns as printed by traceroute, in probe order: "1.234 ms  4.567 ms *" or "* * *". When a probe was
+    /// Probe columns as printed by traceroute, in probe order: "1.234 ms  4.567 ms *" or "* * *"; a probe that could
+    /// not be sent shows its error, e.g. "[sendto: Socket is not connected]". When a probe was
     /// answered by another address than the previous answer (load-balanced paths), that address precedes its time.
     var formattedProbeTimes: String {
         var shownAddress = ipAddress
         var text = ""
         for (index, time) in probeTimes.enumerated() {
             guard let time else {
-                text += " *"
+                // A probe that could not be sent shows its error instead of a "*" that would suggest a timeout
+                if index < probeErrors.count, let error = probeErrors[index] {
+                    text += "  [\(error)]"
+                } else {
+                    text += " *"
+                }
                 continue
             }
             text += "  "

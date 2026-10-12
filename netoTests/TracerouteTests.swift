@@ -84,6 +84,41 @@ struct TracerouteManagerLogicTests {
         #expect(v6(.destinationUnreachable(sequenceNumber: 1, code: 1)) == Verdict(annotation: "!P", reachedTarget: false, unreachable: true))
         #expect(v6(.destinationUnreachable(sequenceNumber: 1, code: 3)) == Verdict(annotation: "!A", reachedTarget: false, unreachable: true))
         #expect(v6(.destinationUnreachable(sequenceNumber: 1, code: 6)) == Verdict(annotation: nil, reachedTarget: false, unreachable: false))
+        #expect(v6(.parameterProblem(sequenceNumber: 1)) == Verdict(annotation: "!H", reachedTarget: true, unreachable: false))
+    }
+
+    @Test func replyWithTTLOfOneIsMarked() {
+        // traceroute.c prints " !" after an echo reply or port unreachable that arrives with TTL <= 1
+        let echo = TracerouteManager.verdict(for: .echoReply(sequenceNumber: 1), family: AF_INET, ttl: 1)
+        let port = TracerouteManager.verdict(for: .destinationUnreachable(sequenceNumber: 1, code: 3), family: AF_INET, ttl: 0)
+        let normal = TracerouteManager.verdict(for: .echoReply(sequenceNumber: 1), family: AF_INET, ttl: 55)
+        let router = TracerouteManager.verdict(for: .timeExceeded(sequenceNumber: 1), family: AF_INET, ttl: 1)
+        #expect(echo.annotation == "!" && echo.reachedTarget)
+        #expect(port.annotation == "!" && port.reachedTarget)
+        #expect(normal.annotation == nil)
+        #expect(router.annotation == nil)
+    }
+
+    @Test func onlyAReplyToTheProbeInFlightWithinItsTimeoutCounts() {
+        typealias Received = TracerouteManager.ReceivedReply
+        let probe = TracerouteManager.AwaitedProbe(sequenceNumber: 7, sentAt: 1_000_000_000, deadline: 3_000_000_000)
+        let lateForEarlierProbe = Received(reply: .timeExceeded(sequenceNumber: 6), address: "10.0.0.6", receivedAt: 1_100_000_000, ttl: 250)
+        let afterDeadline = Received(reply: .timeExceeded(sequenceNumber: 7), address: "10.0.0.8", receivedAt: 3_000_000_001, ttl: 250)
+        let inTime = Received(reply: .timeExceeded(sequenceNumber: 7), address: "10.0.0.7", receivedAt: 1_250_000_000, ttl: 250)
+        let duplicate = Received(reply: .timeExceeded(sequenceNumber: 7), address: "10.0.0.9", receivedAt: 1_300_000_000, ttl: 250)
+        #expect(TracerouteManager.answer(from: [lateForEarlierProbe], to: probe) == nil, "a late reply to an earlier probe is ignored")
+        #expect(TracerouteManager.answer(from: [afterDeadline], to: probe) == nil, "a reply after the timeout is ignored")
+        let answer = TracerouteManager.answer(from: [lateForEarlierProbe, inTime, duplicate], to: probe)
+        #expect(answer?.address == "10.0.0.7")
+        #expect(answer?.time == 250)
+        #expect(answer?.ttl == 250)
+    }
+
+    @Test func probeThatCouldNotBeSentShowsItsError() {
+        let error = "sendto: Socket is not connected"
+        let result = TracerouteResult(hopNumber: 1, success: false, responseTime: 0, message: "",
+                                      probeTimes: [nil, nil, nil], probeAddresses: [nil, nil, nil], probeErrors: [error, nil, error])
+        #expect(result.line == "[\(error)] *  [\(error)]")
     }
 
     @Test(arguments: [Int32(AF_INET), Int32(AF_INET6)])
@@ -188,12 +223,17 @@ final class TracerouteLoopbackTests: XCTestCase {
         XCTAssertEqual(error?.localizedDescription, "Invalid IPv4 address format: 999.1.1.1")
     }
 
-    /// 0.0.0.0 cannot be sent to ("Socket is not connected"): the run stops at once instead of waiting out every probe
-    func testSendFailureEndsTheRunWithTheError() {
+    /// 0.0.0.0 cannot be sent to ("Socket is not connected"): like traceroute every probe shows the error and the
+    /// trace goes on, but nothing waits for probes that were never sent
+    func testSendFailureShowsOnEveryProbeAndDoesNotWait() {
         let (results, completions, error, seconds) = run("0.0.0.0", maxHops: 30, timeout: 2)
         XCTAssertEqual(completions, 1)
-        XCTAssertTrue(results.isEmpty, results.map(\.line).joined(separator: "; "))
-        XCTAssertTrue(error?.localizedDescription.contains("sendto: ") == true, error?.localizedDescription ?? "no error")
+        XCTAssertNil(error, "a send failure is not an error of the run")
+        XCTAssertEqual(results.map(\.hopNumber), Array(1...30))
+        for result in results {
+            XCTAssertFalse(result.success)
+            XCTAssertEqual(result.probeErrors, Array(repeating: "sendto: Socket is not connected", count: TracerouteManager.probesPerHop), result.line)
+        }
         XCTAssertLessThan(seconds, 2, "the run must not wait for probes that were never sent")
     }
 
@@ -282,6 +322,27 @@ struct TracerouteViewModelTests {
         #expect(export.contains("Probe Timeout: 2.0s\n"))
         #expect(export.contains("\n 1  * * *\n"))
         #expect(export.contains("\n 2  (10.0.0.2)  *  2.000 ms *\n"))
+    }
+
+    @Test func stoppedRunStillGetsNamesButNoRowsAndNeverTouchesANewerRun() async throws {
+        let viewModel = TracerouteViewModel()
+        viewModel.targetHost = "999.1.1.1"
+        viewModel.startTraceroute()
+        let run = try #require(viewModel.currentRunID)
+        let hop = TracerouteResult(hopNumber: 1, success: true, ipAddress: "10.0.0.1", responseTime: 1, message: "(10.0.0.1)")
+        viewModel.handleResult(hop, fromRun: run)
+        viewModel.stopTraceroute()
+        let named = TracerouteResult(id: hop.id, hopNumber: 1, success: true, ipAddress: "10.0.0.1", hostname: "gw.local",
+                                     responseTime: 1, message: "gw.local (10.0.0.1)")
+        viewModel.handleResult(named, fromRun: run)
+        #expect(viewModel.tracerouteResults.map(\.hostname) == ["gw.local"], "a late name still reaches the stopped run")
+        viewModel.handleResult(TracerouteResult(hopNumber: 2, success: false, responseTime: 0, message: ""), fromRun: run)
+        #expect(viewModel.tracerouteResults.count == 1, "a stopped run adds no rows")
+
+        viewModel.startTraceroute()
+        viewModel.tracerouteResults = [hop]
+        viewModel.handleResult(named, fromRun: run)
+        #expect(viewModel.tracerouteResults.first?.hostname == nil, "the old run must not touch a newer one")
     }
 
     @Test func nameUpdateReplacesRow() {
